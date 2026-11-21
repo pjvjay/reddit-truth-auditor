@@ -22,7 +22,7 @@
     "watch": "node userscript/build.mjs --watch",
     "lint": "eslint userscript",
     "test": "npm run test:unit && npm run build && npm run test:e2e",
-    "test:unit": "node --test \"userscript/test/unit/*.test.mjs\"",
+    "test:unit": "node --test userscript/test/unit/*.test.mjs",
     "test:e2e": "python3 userscript/test/e2e/test_userscript.py",
     "test:server": "python3 -m pytest server/tests -q"
   },

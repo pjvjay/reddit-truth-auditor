@@ -11,6 +11,7 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
   - The publish lock now uses the browser's Web Locks API first, which is exclusive between tabs on the same Reddit host. The storage lease remains as a second, best-effort layer for tabs on different hosts and for browsers without Web Locks, and is renewed during long runs.
   - A tab now checks what other tabs have already sent before it chooses what to send. Before, a tab would send again whatever was still marked pending in its own copy of the index.
   - The server no longer counts a repeated report (same client, proposition and post) against the daily quota, and reports the number in `duplicates`. Reports it rejects as invalid are not counted either.
+- `npm run test:unit` now runs on Node 18 and 20 too. The test file pattern was quoted, which only Node 21 and later expand, so the CI job on Node 20 found no tests.
 
 ### Changed
 - The documentation no longer says two tabs never send the same reports. See *Several tabs* in `docs/architecture.md` for what is and is not guaranteed.
