@@ -8,9 +8,10 @@
  *
  * Publish state (`ps`) per entry:
  *   0 NONE      not publishable (accurate, joke, no canonical claim, legacy)
- *   1 PENDING   waiting to be shared with the community server
+ *   1 PENDING   waiting to be shared with the community server (also while the
+ *               server's daily quota is used up - those are sent after it resets)
  *   2 SENT      accepted by the server
- *   3 REJECTED  refused by the server (validation) - never retried automatically
+ *   3 REJECTED  refused by the server as invalid - never retried automatically
  */
 import { storage } from '../core/env.js';
 import { settings, KEYS, dupThreshold } from '../core/settings.js';

@@ -61,6 +61,12 @@ def today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def quota_reset(day: str) -> int:
+    """Epoch seconds of the UTC midnight that ends `day` - when the per-client daily quota starts again."""
+    d = date.fromisoformat(day) + timedelta(days=1)
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+
+
 class Store:
     def __init__(self, path: str, merge_threshold: float = 0.85, max_reports_per_client_day: int = 2000, max_report_age_days: int = 30):
         self.path = path
@@ -125,18 +131,30 @@ class Store:
                             (client, day, allowed, allowed))
         return allowed
 
+    def quota(self, client: str, day: str | None = None) -> dict:
+        """Where a client stands against its daily quota (the day is the server's UTC day)."""
+        day = day or today()
+        row = self.db.execute("SELECT n FROM client_days WHERE client=? AND day=?", (client, day)).fetchone()
+        used = row["n"] if row else 0
+        return {"limit": self.max_per_day, "used": used, "remaining": max(0, self.max_per_day - used), "resets_at": quota_reset(day)}
+
     def ingest(self, client: str, reports: list[dict]) -> dict:
+        """
+        Store a batch. Each rejection carries a machine-readable `code`:
+          "quota"    over the client's daily quota - nothing is wrong with the report; send it again after `quota.resets_at`
+          "invalid"  the report itself cannot be used - sending it again will not help
+        """
         accepted, rejected, keys = 0, [], []
         server_day = today()
         with self.lock, self.db:
             allowed = self._quota(client, server_day, len(reports))
             for i, r in enumerate(reports):
                 if i >= allowed:
-                    rejected.append({"index": i, "reason": "daily quota exceeded"})
+                    rejected.append({"index": i, "code": "quota", "reason": "daily quota exceeded"})
                     continue
                 canon = canonicalize(r["claim"])
                 if canon is None:
-                    rejected.append({"index": i, "reason": "claim has no subject/object"})
+                    rejected.append({"index": i, "code": "invalid", "reason": "claim has no subject/object"})
                     continue
                 # the day the post was SEEN: clients publish offline backlogs later, so accept up to
                 # max_report_age_days back - but never a day in the future or older than that
@@ -170,9 +188,10 @@ class Store:
                     self.db.execute("INSERT OR IGNORE INTO link_reports(key, url_hash, client) VALUES (?,?,?)", (key, r["url_hash"], client))
                 accepted += 1
                 keys.append(key)
+            quota = self.quota(client, server_day)
         if accepted:
             self._dirty = True
-        return {"accepted": accepted, "rejected": rejected, "keys": keys}
+        return {"accepted": accepted, "rejected": rejected, "keys": keys, "quota": quota}
 
     def _upsert_post(self, r: dict, day: str, server_day: str) -> None:
         src, att, eng = r.get("source") or {}, r.get("attributed") or {}, r.get("engagement") or {}

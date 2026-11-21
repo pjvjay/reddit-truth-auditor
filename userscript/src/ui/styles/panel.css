@@ -1511,6 +1511,10 @@ input[type="range"].neutral {
 .comm-status .dot.off {
   background: var(--warn);
 }
+.conn.quota,
+.comm-status .quota {
+  color: #ffd89c;
+}
 .comm-status .dot:not(.on):not(.off) {
   background: var(--muted);
 }

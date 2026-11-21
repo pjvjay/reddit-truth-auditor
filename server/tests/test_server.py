@@ -2,7 +2,9 @@
 import hashlib
 import os
 import sys
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient  # noqa: E402
 
 from rta_server import app as app_module  # noqa: E402
+from rta_server import store as store_module  # noqa: E402
 from rta_server.claimsig import canonicalize, similarity, tokenize  # noqa: E402
 
 WHO = {"subject": "World Health Organization", "predicate": "states", "object": "5G towers spread the coronavirus", "topic": "health"}
@@ -175,6 +178,43 @@ def test_validation_quota_and_token(api, tmp_path, monkeypatch):
     cid = client_id()
     r = send(locked, cid, [report(post=f"t3_{i}") for i in range(5)], **{"X-RTA-Token": "s3cret"}).json()
     assert r["accepted"] == 3 and len(r["rejected"]) == 2
+
+
+def limited(tmp_path, monkeypatch, per_day):
+    monkeypatch.setenv("RTA_MAX_REPORTS_PER_DAY", str(per_day))
+    monkeypatch.delenv("RTA_PUBLISH_TOKENS", raising=False)
+    return TestClient(app_module.create_app(str(tmp_path / "quota.sqlite3")))
+
+
+def test_quota_rejections_are_marked_and_accepted_after_the_reset(tmp_path, monkeypatch):
+    api = limited(tmp_path, monkeypatch, 5)
+    cid = client_id()
+    r = send(api, cid, [report(post=f"t3_{i}") for i in range(8)]).json()
+    assert r["accepted"] == 5
+    assert [(x["index"], x["code"], x["reason"]) for x in r["rejected"]] == [(i, "quota", "daily quota exceeded") for i in (5, 6, 7)]
+    q = r["quota"]
+    assert (q["limit"], q["used"], q["remaining"]) == (5, 5, 0)
+    assert q["resets_at"] % 86400 == 0 and 0 < q["resets_at"] - time.time() <= 86400          # the next UTC midnight
+    # nothing was stored for the three over the quota ...
+    assert api.get(f"/v1/propositions/{canonicalize(WHO).key}").json()["counts"]["posts"] == 5
+    # ... and the next day the same three are taken
+    tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+    monkeypatch.setattr(store_module, "today", lambda: tomorrow)
+    r = send(api, cid, [report(post=f"t3_{i}") for i in range(5, 8)]).json()
+    assert r["accepted"] == 3 and r["rejected"] == [] and r["quota"]["used"] == 3
+    assert api.get(f"/v1/propositions/{canonicalize(WHO).key}").json()["counts"]["posts"] == 8
+
+
+def test_rejections_carry_a_code_and_the_position_in_the_request(tmp_path, monkeypatch):
+    api = limited(tmp_path, monkeypatch, 2)
+    batch = [report(tone="satirical", post="t3_joke"), report(post="t3_0"), report(post="t3_1"), report(post="t3_2")]
+    r = send(api, client_id(), batch).json()
+    assert r["accepted"] == 2
+    # the joke is dropped before the quota is applied, so the report over the quota is the 4th one sent (index 3)
+    assert [(x["index"], x["code"]) for x in r["rejected"]] == [(0, "joke"), (3, "quota")]
+    nothing = {"subject": "", "predicate": "is", "object": ""}
+    r = send(api, client_id(), [report(claim=nothing, post="t3_n")]).json()
+    assert r["accepted"] == 0 and [(x["index"], x["code"]) for x in r["rejected"]] == [(0, "invalid")]
 
 
 def test_canonicalize_endpoint_matches_library(api):

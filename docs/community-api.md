@@ -92,6 +92,29 @@ The client only reports claims whose proposition it judged **false** (`prop_trut
 | `local` | Reused from the user's own log (a repost) | yes (same vote) | yes |
 | `community` | Verdict taken from the feed | **no** – prevents feedback loops | yes |
 
+The response says what happened to each report:
+
+```json
+{
+  "accepted": 5,
+  "keys": ["p1_…", "…"],              // proposition keys of the accepted reports, in order
+  "rejected": [                        // one entry per report that was not stored
+    {"index": 5, "code": "quota", "reason": "daily quota exceeded"}
+  ],
+  "quota": {"limit": 2000, "used": 2000, "remaining": 0, "resets_at": 1795305600}
+}
+```
+
+`index` is the report's position in the request. `code` tells a client what to do with it:
+
+| `code` | Meaning | What the client does |
+|---|---|---|
+| `quota` | Over the sender's daily quota. Nothing is wrong with the report. | Keeps it queued and sends it again after `quota.resets_at` (epoch seconds, the next UTC midnight). |
+| `invalid` | The claim has no subject or object. | Marks it rejected; it is not sent again. |
+| `joke` | Humour or satire not presented as fact. | Marks it rejected; it is not sent again. |
+
+A batch that is partly over the quota is still a `200`: the reports that fit are stored and the rest come back as `quota`.
+
 Storage model:
 - **Votes:** one per (proposition, client), with the latest winning.
 - **Sightings:** one per (proposition, post, client). Distinct posts measure *spread*; rows measure *exposures*.
@@ -222,7 +245,7 @@ Caveats:
 
 - **Quorum:** the feed needs *N* independent client ids (default 3) **and** ≥ 66 % weighted agreement. Link hashes need the same quorum.
 - **One vote per client per proposition**, and community-derived results never vote.
-- **Quotas:** `RTA_MAX_REPORTS_PER_DAY` per client id (default 2000), and `RTA_IP_RATE_PER_MIN` per IP (default 120).
+- **Quotas:** `RTA_MAX_REPORTS_PER_DAY` per client id (default 2000, counted per UTC day), and `RTA_IP_RATE_PER_MIN` per IP (default 120). Reports over the daily quota are rejected with code `quota` and can be sent again the next day (see §2).
 - **Optional publishing tokens** (`RTA_PUBLISH_TOKENS`): hand tokens to trusted users or communities. Reading the feed stays public.
 - Strict validation on every field (lengths, enums, hex hashes, subreddit pattern, host pattern). Invalid batches get `422`. The dashboard escapes all content.
 - Engagement is capped per field and only enters weights through logarithms, so inflated numbers have limited effect. A cluster's weight also needs several independent reporters (consensus factor).

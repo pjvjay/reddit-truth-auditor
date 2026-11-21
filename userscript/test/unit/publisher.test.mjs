@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { settings, DEFAULTS, KEYS } from '../../src/core/settings.js';
 import { researchLog, PUBLISH } from '../../src/store/research-log.js';
 import { buildCanon } from '../../src/text/canonical.js';
-import { isReportable, reportContext, buildReport, flush, queuedCount, resetBackoff } from '../../src/community/publisher.js';
+import { isReportable, reportContext, buildReport, flush, queuedCount, resetBackoff, quotaNotice, quotaHeldUntil } from '../../src/community/publisher.js';
 import { communityStatus } from '../../src/community/config.js';
 
 const WHO = { subject: 'World Health Organization', predicate: 'states', object: '5G towers spread the coronavirus', polarity: 'affirms', topic: 'health' };
@@ -25,6 +25,28 @@ async function analysed({ truth = 1, tone = 'sincere', paf = false, canon = WHO,
 }
 
 const accept = (req) => ({ status: 200, json: { accepted: JSON.parse(req.data).reports.length, rejected: [] } });
+
+/**
+ * A server with a daily quota, answering the way rta_server does: reports over the
+ * quota are rejected one by one inside a 200. `codes: false` imitates a v2.0.0 server,
+ * which gives only the reason text and no quota block. Set `.used = 0` for a new day.
+ */
+function quotaServer(limit, { codes = true, resetsAt = () => Date.now() + 3600e3 } = {}) {
+  const server = { used: 0 };
+  respond((req) => {
+    const rejected = [];
+    let accepted = 0;
+    JSON.parse(req.data).reports.forEach((_, index) => {
+      if (server.used < limit) { server.used++; accepted++; }
+      else rejected.push({ index, ...(codes ? { code: 'quota' } : {}), reason: 'daily quota exceeded' });
+    });
+    const json = { accepted, rejected };
+    if (codes) json.quota = { limit, used: server.used, remaining: limit - server.used, resets_at: Math.floor(resetsAt() / 1000) };
+    return { status: 200, json };
+  });
+  return server;
+}
+const states = (ids) => ids.map((id) => researchLog.idx.get(id).ps);
 
 beforeEach(() => {
   resetGM();
@@ -141,6 +163,74 @@ test('per-report rejections from a 200 response are recorded', async () => {
   await flush();
   assert.equal(researchLog.idx.get(a).ps, PUBLISH.SENT);
   assert.equal(researchLog.idx.get(b).ps, PUBLISH.REJECTED);
+});
+
+test('reports over the daily quota stay queued, the user is told, and they are sent after the quota resets', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const ids = [];
+  for (let i = 0; i < 8; i++) ids.push(await analysed());
+  const reset = (Math.floor(Date.now() / 1000) + 6 * 3600) * 1000; // the server gives whole seconds
+  const server = quotaServer(5, { resetsAt: () => reset });
+
+  assert.equal(await flush(), 'quota');
+  const { SENT, PENDING } = PUBLISH;
+  assert.deepEqual(states(ids), [SENT, SENT, SENT, SENT, SENT, PENDING, PENDING, PENDING], 'the three over the quota are still queued, not rejected');
+  assert.equal(queuedCount(), 3);
+  assert.equal(communityStatus().sent, 5);
+  assert.equal(quotaHeldUntil(), reset + 60e3, 'held until the reset the server gave, plus a minute of slack');
+  assert.match(quotaNotice(), /^Daily sharing limit reached – 3 reports kept and will be sent automatically after \S/);
+
+  // while held, the timer and new results do not hammer the server; "Publish now" asks once and is told the same
+  assert.equal(await flush(), 'quota');
+  assert.equal(requests.length, 1);
+  assert.equal(await flush({ force: true }), 'quota');
+  assert.equal(requests.length, 2);
+  assert.equal(queuedCount(), 3);
+
+  // the next day
+  t.mock.timers.setTime(reset + 61e3);
+  server.used = 0;
+  assert.equal(quotaHeldUntil(), 0);
+  assert.equal(await flush(), 'sent');
+  assert.equal(requests[2].body.reports.length, 3, 'exactly the three that were held');
+  assert.deepEqual(states(ids), ids.map(() => SENT));
+  assert.equal(communityStatus().sent, 8);
+  assert.equal(communityStatus().quotaUntil, 0);
+  assert.equal(quotaNotice(), null);
+});
+
+test('a quota rejection is told apart from an invalid report in the same response', async () => {
+  const ids = [await analysed(), await analysed(), await analysed()];
+  respond(() => ({ status: 200, json: { accepted: 1, quota: { limit: 1, used: 1, remaining: 0, resets_at: Math.floor(Date.now() / 1000) + 3600 },
+    rejected: [{ index: 1, code: 'invalid', reason: 'claim has no subject/object' }, { index: 2, code: 'quota', reason: 'daily quota exceeded' }] } }));
+  assert.equal(await flush(), 'quota');
+  assert.deepEqual(states(ids), [PUBLISH.SENT, PUBLISH.REJECTED, PUBLISH.PENDING]);
+});
+
+test('a v2.0.0 server that only says "daily quota exceeded" is understood: held until the next UTC midnight', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 21, 15, 0, 0) });
+  const ids = [await analysed(), await analysed()];
+  quotaServer(1, { codes: false });
+  assert.equal(await flush(), 'quota');
+  assert.deepEqual(states(ids), [PUBLISH.SENT, PUBLISH.PENDING]);
+  assert.equal(quotaHeldUntil(), Date.UTC(2026, 10, 22, 0, 1, 0));
+});
+
+test('a reset time far in the future cannot park the queue: it is tried again within about a day', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  await analysed();
+  quotaServer(0, { resetsAt: () => Date.now() + 400 * 864e5 });
+  assert.equal(await flush(), 'quota');
+  assert.ok(quotaHeldUntil() <= Date.now() + 25 * 3600e3 + 60e3);
+});
+
+test('legacy outbox entries over the quota are kept as well', async () => {
+  store.set(KEYS.legacyOutbox, [1, 2, 3].map((i) => ({ _id: `x${i}`, claim: WHO, key: 'p1_x', claim_truth: 1, post: String(i).repeat(32) })));
+  quotaServer(2);
+  assert.equal(await flush(), 'quota');
+  assert.deepEqual(store.get(KEYS.legacyOutbox).map((x) => x._id), ['x3']);
+  assert.equal(queuedCount(), 1);
+  assert.ok(quotaHeldUntil() > Date.now());
 });
 
 test('reports carry the day the post was SEEN, not the day they were published', async () => {

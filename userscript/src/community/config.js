@@ -30,6 +30,7 @@ const STATUS_DEFAULTS = {
   lastSend: 0,
   sendError: null,
   authError: false, //    server rejected the publishing token - publishing paused until settings change
+  quotaUntil: 0, //       server's daily quota used up - queued reports wait until this time (ms), then are sent
 };
 
 export function communityStatus() {

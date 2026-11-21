@@ -7,7 +7,7 @@ import { llmJson } from '../analysis/llm.js';
 import { researchLog } from '../store/research-log.js';
 import { knowledge } from '../community/knowledge.js';
 import { communityConfigured, communityStatus, resetClientId } from '../community/config.js';
-import { flush, queuedCount, discardQueued } from '../community/publisher.js';
+import { flush, queuedCount, discardQueued, quotaNotice } from '../community/publisher.js';
 import { h, icon, setChildren } from './dom.js';
 import { ui } from './context.js';
 
@@ -91,6 +91,7 @@ export function updateCommunityStatus() {
   if (!el || !el.isConnected) return;
   const st = communityStatus();
   const queued = queuedCount();
+  const limit = quotaNotice();
   if (!communityConfigured()) {
     setChildren(el, h('div', {}, 'Not connected. Tick “Join” and enter a server URL, then Save.'),
       queued ? h('div', {}, `${plural(queued, 'report')} from your research log will be shared once you connect.`) : null);
@@ -105,6 +106,7 @@ export function updateCommunityStatus() {
     st.authError ? h('div', { class: 'err' }, 'The server rejected the publishing token. Reports are kept and sent once it is fixed.') : null,
     st.syncError ? h('div', { class: 'err' }, `Sync: ${st.syncError}`) : null,
     st.sendError && !st.authError ? h('div', { class: 'err' }, `Publishing: ${st.sendError}`) : null,
+    limit ? h('div', { class: 'quota' }, limit) : null,
     h('div', { class: 'row' },
       h('button', { class: 'btn small', type: 'button', onclick: () => knowledge.sync(true) }, icon('refresh', 13), 'Sync list now'),
       h('button', { class: 'btn small', type: 'button', onclick: () => flush({ force: true }) }, icon('globe', 13), 'Publish now'),

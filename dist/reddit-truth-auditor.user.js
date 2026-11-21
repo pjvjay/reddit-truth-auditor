@@ -938,8 +938,10 @@ ${String(p.body || "").slice(0, 3e3)}`;
     //             reports accepted by the server (lifetime)
     lastSend: 0,
     sendError: null,
-    authError: false
+    authError: false,
     //    server rejected the publishing token - publishing paused until settings change
+    quotaUntil: 0
+    //       server's daily quota used up - queued reports wait until this time (ms), then are sent
   };
   function communityStatus() {
     const s = storage.get(KEYS.commStatus, null);
@@ -994,7 +996,7 @@ ${String(p.body || "").slice(0, 3e3)}`;
     feed: (minClients2) => request("GET", `/v1/propositions/feed?min_clients=${minClients2}`),
     /** Ranked event clusters of propagating false claims (rta.clusters/1). */
     clusters: (limit = 25) => request("GET", `/v1/clusters?limit=${limit}`),
-    /** Publish a batch of anonymous reports (rta.report/1). Returns { accepted, rejected: [{index, reason}], keys }. */
+    /** Publish a batch of anonymous reports (rta.report/1). Returns { accepted, rejected: [{index, code, reason}], keys, quota }. */
     publish: (batch) => request("POST", "/v1/reports", batch)
   };
 
@@ -1196,6 +1198,8 @@ ${String(p.body || "").slice(0, 3e3)}`;
   var MAX_ROUNDS = 20;
   var LOCK_KEY = "rta.community.publishLock";
   var LOCK_MS = 6e4;
+  var QUOTA_SLACK_MS = 6e4;
+  var QUOTA_MAX_HOLD_MS = 25 * 36e5;
   var TAB = Math.random().toString(36).slice(2);
   var SUBREDDIT_RE = /^[A-Za-z0-9_]{2,21}$/;
   var busy = false;
@@ -1282,18 +1286,45 @@ ${String(p.body || "").slice(0, 3e3)}`;
     nextTry = Date.now() + Math.min(36e5, 3e4 * 2 ** Math.min(fails - 1, 7));
     setCommunityStatus({ sendError: `${e.message} – queued reports will be sent automatically when the server is reachable` });
   }
+  var overQuota = (x) => !!x && (x.code === "quota" || x.code == null && /quota/i.test(String(x.reason || "")));
+  function quotaResetAt(res) {
+    const now = Date.now();
+    const told = Number(res && res.quota && res.quota.resets_at) * 1e3;
+    const midnight = new Date(now);
+    midnight.setUTCHours(24, 0, 0, 0);
+    return Math.min(told > now ? told : midnight.getTime(), now + QUOTA_MAX_HOLD_MS) + QUOTA_SLACK_MS;
+  }
+  function quotaHeldUntil() {
+    const t = Number(communityStatus().quotaUntil) || 0;
+    return t > Date.now() ? t : 0;
+  }
+  function quotaNotice() {
+    const until = quotaHeldUntil();
+    const n = queuedCount();
+    if (!until || !n) return null;
+    const at = new Date(until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return `Daily sharing limit reached – ${plural(n, "report")} kept and will be sent automatically after ${at}.`;
+  }
   async function drainLegacyOutbox() {
     for (let box = legacyOutbox(); box.length; box = legacyOutbox()) {
       const batch = box.slice(0, BATCH_SIZE);
       try {
         const res = await api.publish({ schema: "rta.report/1", client: clientId(), reports: batch.map(({ _id, ...rest }) => rest) });
-        setCommunityStatus({ sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null });
+        const patch = { sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null };
+        const over = new Set((res.rejected || []).filter(overQuota).map((x) => x.index));
+        if (over.size) {
+          storage.set(KEYS.legacyOutbox, [...batch.filter((_, i) => over.has(i)), ...box.slice(batch.length)]);
+          setCommunityStatus({ ...patch, quotaUntil: quotaResetAt(res) });
+          return false;
+        }
+        setCommunityStatus(patch);
       } catch (e) {
         if (e.transient || e.auth) throw e;
       }
       storage.set(KEYS.legacyOutbox, box.slice(batch.length));
     }
     storage.remove(KEYS.legacyOutbox);
+    return true;
   }
   async function flush({ force = false } = {}) {
     if (!communityConfigured() || !settings.shareReports) return "disabled";
@@ -1301,13 +1332,15 @@ ${String(p.body || "").slice(0, 3e3)}`;
     if (busy) return "busy";
     if (!force && Date.now() < nextTry) return "backoff";
     if (!queuedCount()) return "idle";
+    if (!force && quotaHeldUntil()) return "quota";
     if (!acquireLock()) return "locked";
     busy = true;
     let result = "idle";
     try {
-      await drainLegacyOutbox();
+      const drained = await drainLegacyOutbox();
+      if (!drained) result = "quota";
       let size = BATCH_SIZE;
-      for (let round = 0; round < MAX_ROUNDS; round++) {
+      for (let round = 0; drained && round < MAX_ROUNDS; round++) {
         const batch = eligible(size);
         if (!batch.length) break;
         const built = [], gone = [];
@@ -1322,13 +1355,25 @@ ${String(p.body || "").slice(0, 3e3)}`;
         storage.set(KEYS.lastPayload, body);
         try {
           const res = await api.publish(body);
-          const rejected = new Set((res.rejected || []).map((x) => x.index));
-          const ids = (keep) => built.filter((_, i) => rejected.has(i) === keep).map(([id]) => id);
-          researchLog.setPublishState(ids(false), PUBLISH.SENT);
-          if (rejected.size) researchLog.setPublishState(ids(true), PUBLISH.REJECTED);
+          const rejected = new Map((res.rejected || []).map((x) => [x.index, x]));
+          const sent = [], refused = [], waiting = [];
+          built.forEach(([id], i) => {
+            const why = rejected.get(i);
+            (!why ? sent : overQuota(why) ? waiting : refused).push(id);
+          });
+          researchLog.setPublishState(sent, PUBLISH.SENT);
+          if (refused.length) researchLog.setPublishState(refused, PUBLISH.REJECTED);
           fails = 0;
           nextTry = 0;
-          setCommunityStatus({ sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null, authError: false });
+          const accepted = Number(res.accepted) || 0;
+          const patch = { sent: communityStatus().sent + accepted, sendError: null, authError: false };
+          if (accepted) patch.lastSend = Date.now();
+          if (waiting.length) {
+            setCommunityStatus({ ...patch, quotaUntil: quotaResetAt(res) });
+            result = "quota";
+            break;
+          }
+          setCommunityStatus({ ...patch, quotaUntil: 0 });
           result = "sent";
         } catch (e) {
           if (e.auth) {
@@ -1391,13 +1436,17 @@ ${String(p.body || "").slice(0, 3e3)}`;
       if (researchLog.pendingCount()) schedule();
     });
     on("community:feed", queueVotesForListed);
-    on("settings:changed", () => {
+    on("settings:changed", (prev) => {
       resetBackoff();
-      if (communityStatus().authError) setCommunityStatus({ authError: false });
+      const st = communityStatus();
+      const patch = {};
+      if (st.authError) patch.authError = false;
+      if (st.quotaUntil && prev && prev.communityUrl !== settings.communityUrl) patch.quotaUntil = 0;
+      if (Object.keys(patch).length) setCommunityStatus(patch);
       flush();
     });
   }
-  var publisherState = () => ({ busy, fails, nextTry, queued: queuedCount() });
+  var publisherState = () => ({ busy, fails, nextTry, queued: queuedCount(), quotaUntil: quotaHeldUntil() });
 
   // userscript/src/reddit/adapters.js
   var normId = (v) => {
@@ -3990,6 +4039,7 @@ Return ONLY JSON:
     if (!el || !el.isConnected) return;
     const st = communityStatus();
     const queued = queuedCount();
+    const limit = quotaNotice();
     if (!communityConfigured()) {
       setChildren(
         el,
@@ -4013,6 +4063,7 @@ Return ONLY JSON:
       st.authError ? h("div", { class: "err" }, "The server rejected the publishing token. Reports are kept and sent once it is fixed.") : null,
       st.syncError ? h("div", { class: "err" }, `Sync: ${st.syncError}`) : null,
       st.sendError && !st.authError ? h("div", { class: "err" }, `Publishing: ${st.sendError}`) : null,
+      limit ? h("div", { class: "quota" }, limit) : null,
       h(
         "div",
         { class: "row" },
@@ -5814,6 +5865,10 @@ input[type="range"].neutral {
 .comm-status .dot.off {
   background: var(--warn);
 }
+.conn.quota,
+.comm-status .quota {
+  color: #ffd89c;
+}
 .comm-status .dot:not(.on):not(.off) {
   background: var(--muted);
 }
@@ -6090,6 +6145,7 @@ li.rta-li {
     const community = communityConfigured();
     const st = communityStatus();
     const queued = queuedCount();
+    const limit = community ? quotaNotice() : null;
     setChildren(
       ui.usage,
       h("div", {}, "Today ", h("b", {}, `$${u.usd.toFixed(4)}`), cap > 0 ? ` of $${cap.toFixed(2)} cap` : " (no cap)"),
@@ -6100,7 +6156,8 @@ li.rta-li {
         h("span", { class: "dot" }),
         st.online === false || !browserOnline() ? "Community offline" : "Community connected",
         queued ? ` · ${plural(queued, "report")} queued` : ""
-      ) : null
+      ) : null,
+      limit ? h("div", { class: "conn quota" }, limit) : null
     );
   }
   function updateEmpty() {

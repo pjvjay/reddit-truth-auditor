@@ -12,7 +12,7 @@ import { isFlagged } from '../analysis/risk.js';
 import { researchLog } from '../store/research-log.js';
 import { getUsage, budgetLeft } from '../store/usage.js';
 import { communityConfigured, communityStatus } from '../community/config.js';
-import { queuedCount } from '../community/publisher.js';
+import { queuedCount, quotaNotice } from '../community/publisher.js';
 import { jobs, runtime, clearHalt, clearSession, queueStats } from '../pipeline/jobs.js';
 import { rearm } from '../pipeline/scanner.js';
 import { h, icon, setChildren } from './dom.js';
@@ -131,12 +131,14 @@ export function updateFooter() {
   const community = communityConfigured();
   const st = communityStatus();
   const queued = queuedCount();
+  const limit = community ? quotaNotice() : null;
   setChildren(ui.usage,
     h('div', {}, 'Today ', h('b', {}, `$${u.usd.toFixed(4)}`), cap > 0 ? ` of $${cap.toFixed(2)} cap` : ' (no cap)'),
     h('div', {}, `${u.checks || 0} checked · ${u.reused || 0} reused from log · ${community ? `${u.community || 0} from community · ` : ''}${u.searches || 0} search${u.searches === 1 ? '' : 'es'}`),
     community ? h('div', { class: `conn ${st.online === false || !browserOnline() ? 'off' : ''}` },
       h('span', { class: 'dot' }), st.online === false || !browserOnline() ? 'Community offline' : 'Community connected',
-      queued ? ` · ${plural(queued, 'report')} queued` : '') : null);
+      queued ? ` · ${plural(queued, 'report')} queued` : '') : null,
+    limit ? h('div', { class: 'conn quota' }, limit) : null);
 }
 
 function updateEmpty() {

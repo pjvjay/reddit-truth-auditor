@@ -46,6 +46,6 @@ export const api = {
   feed: (minClients) => request('GET', `/v1/propositions/feed?min_clients=${minClients}`),
   /** Ranked event clusters of propagating false claims (rta.clusters/1). */
   clusters: (limit = 25) => request('GET', `/v1/clusters?limit=${limit}`),
-  /** Publish a batch of anonymous reports (rta.report/1). Returns { accepted, rejected: [{index, reason}], keys }. */
+  /** Publish a batch of anonymous reports (rta.report/1). Returns { accepted, rejected: [{index, code, reason}], keys, quota }. */
   publish: (batch) => request('POST', '/v1/reports', batch),
 };

@@ -80,7 +80,9 @@ Cheapest check first; every outcome is stored in the research log.
                                                     ▼
  flush(): configured & sharing? ─ cross-tab lock ─ oldest PENDING first (≤ 50 per request)
           │ build report from the stored record (hashes computed now, `day` = when the post was seen)
-          ├─ 2xx            → SENT (per-report rejections → REJECTED)
+          ├─ 2xx            → SENT (reports the server calls invalid → REJECTED)
+          │    over the daily quota (code "quota") → stay PENDING, pause until the
+          │    server's reset time, status line "Daily sharing limit reached – N reports kept …"
           ├─ network/5xx/429→ keep PENDING, exponential back-off 30 s … 1 h, status "offline"
           ├─ 401/403        → keep PENDING, pause until settings change ("token rejected")
           └─ 422/other 4xx  → retry one report at a time → the refused one is REJECTED

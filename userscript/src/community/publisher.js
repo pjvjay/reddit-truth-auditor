@@ -13,13 +13,15 @@
  *   401 / 403           -> keep pending, pause until settings change (auth error)
  *   422 / other 4xx     -> retry one report at a time to isolate the bad record,
  *                          which is then marked REJECTED (never retried)
+ *   over the daily quota -> keep pending, pause until the server's quota resets
+ *                          (the server says so per report, inside a 2xx response)
  * A best-effort cross-tab lock stops two tabs sending the same batch.
  */
 import { storage } from '../core/env.js';
 import { settings, KEYS } from '../core/settings.js';
 import { emit, on } from '../core/events.js';
 import { log } from '../core/logger.js';
-import { utcDay, truncate, str, safeUrl } from '../core/util.js';
+import { utcDay, truncate, str, safeUrl, plural } from '../core/util.js';
 import { urlKey } from '../text/tokenize.js';
 import { hashRef } from '../text/canonical.js';
 import { harmlessJoke, toneOf } from '../text/tone.js';
@@ -34,6 +36,8 @@ export const BATCH_SIZE = 50;
 const MAX_ROUNDS = 20;
 const LOCK_KEY = 'rta.community.publishLock';
 const LOCK_MS = 60e3;
+const QUOTA_SLACK_MS = 60e3; //          wait this long past the reset, so clocks need not agree exactly
+const QUOTA_MAX_HOLD_MS = 25 * 3600e3; // a daily quota resets within a day, whatever a server claims
 const TAB = Math.random().toString(36).slice(2);
 const SUBREDDIT_RE = /^[A-Za-z0-9_]{2,21}$/;
 
@@ -137,24 +141,66 @@ function backoff(e) {
   setCommunityStatus({ sendError: `${e.message} – queued reports will be sent automatically when the server is reachable` });
 }
 
-/** v1.3-1.4 kept pre-built reports in an outbox; send those first. */
+// ---------------------------------------------------------------- daily quota
+/**
+ * The server answers reports over the sender's daily quota inside a 2xx response,
+ * as rejections with code "quota" (older servers only say so in `reason`).
+ * Nothing is wrong with those reports, so they stay queued until the quota resets.
+ */
+const overQuota = (x) => !!x && (x.code === 'quota' || (x.code == null && /quota/i.test(String(x.reason || ''))));
+
+/** When to try again: the reset time the server gave, else the next UTC midnight (its quota runs per UTC day). */
+function quotaResetAt(res) {
+  const now = Date.now();
+  const told = Number(res && res.quota && res.quota.resets_at) * 1000;
+  const midnight = new Date(now);
+  midnight.setUTCHours(24, 0, 0, 0);
+  return Math.min(told > now ? told : midnight.getTime(), now + QUOTA_MAX_HOLD_MS) + QUOTA_SLACK_MS;
+}
+
+/** Time (ms) until which the server's daily quota holds the queue, or 0 when it does not. */
+export function quotaHeldUntil() {
+  const t = Number(communityStatus().quotaUntil) || 0;
+  return t > Date.now() ? t : 0;
+}
+
+/** Status line for the UI while queued reports wait for the daily quota to reset (null otherwise). */
+export function quotaNotice() {
+  const until = quotaHeldUntil();
+  const n = queuedCount();
+  if (!until || !n) return null;
+  const at = new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return `Daily sharing limit reached – ${plural(n, 'report')} kept and will be sent automatically after ${at}.`;
+}
+
+/** v1.3-1.4 kept pre-built reports in an outbox; send those first. Returns false if the daily quota stopped it. */
 async function drainLegacyOutbox() {
   for (let box = legacyOutbox(); box.length; box = legacyOutbox()) {
     const batch = box.slice(0, BATCH_SIZE);
     try {
       const res = await api.publish({ schema: 'rta.report/1', client: clientId(), reports: batch.map(({ _id, ...rest }) => rest) });
-      setCommunityStatus({ sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null });
+      const patch = { sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null };
+      const over = new Set((res.rejected || []).filter(overQuota).map((x) => x.index));
+      if (over.size) {
+        storage.set(KEYS.legacyOutbox, [...batch.filter((_, i) => over.has(i)), ...box.slice(batch.length)]);
+        setCommunityStatus({ ...patch, quotaUntil: quotaResetAt(res) });
+        return false;
+      }
+      setCommunityStatus(patch);
     } catch (e) {
       if (e.transient || e.auth) throw e;
     }
     storage.set(KEYS.legacyOutbox, box.slice(batch.length));
   }
   storage.remove(KEYS.legacyOutbox);
+  return true;
 }
 
 /**
  * Publish what is queued. Safe to call any time; returns one of
- * 'disabled' | 'auth' | 'busy' | 'backoff' | 'locked' | 'idle' | 'sent' | 'offline'.
+ * 'disabled' | 'auth' | 'busy' | 'backoff' | 'quota' | 'locked' | 'idle' | 'sent' | 'offline'.
+ * 'quota': the server's daily quota is used up - what it accepted is marked sent,
+ * the rest stays queued and is sent after the quota resets (`force` tries at once).
  */
 export async function flush({ force = false } = {}) {
   if (!communityConfigured() || !settings.shareReports) return 'disabled';
@@ -162,13 +208,15 @@ export async function flush({ force = false } = {}) {
   if (busy) return 'busy';
   if (!force && Date.now() < nextTry) return 'backoff';
   if (!queuedCount()) return 'idle';
+  if (!force && quotaHeldUntil()) return 'quota';
   if (!acquireLock()) return 'locked';
   busy = true;
   let result = 'idle';
   try {
-    await drainLegacyOutbox();
+    const drained = await drainLegacyOutbox();
+    if (!drained) result = 'quota';
     let size = BATCH_SIZE;
-    for (let round = 0; round < MAX_ROUNDS; round++) {
+    for (let round = 0; drained && round < MAX_ROUNDS; round++) {
       const batch = eligible(size);
       if (!batch.length) break;
       const built = [], gone = [];
@@ -183,13 +231,25 @@ export async function flush({ force = false } = {}) {
       storage.set(KEYS.lastPayload, body);
       try {
         const res = await api.publish(body);
-        const rejected = new Set((res.rejected || []).map((x) => x.index));
-        const ids = (keep) => built.filter((_, i) => rejected.has(i) === keep).map(([id]) => id);
-        researchLog.setPublishState(ids(false), PUBLISH.SENT);
-        if (rejected.size) researchLog.setPublishState(ids(true), PUBLISH.REJECTED);
+        const rejected = new Map((res.rejected || []).map((x) => [x.index, x]));
+        const sent = [], refused = [], waiting = [];
+        built.forEach(([id], i) => {
+          const why = rejected.get(i);
+          (!why ? sent : overQuota(why) ? waiting : refused).push(id);
+        });
+        researchLog.setPublishState(sent, PUBLISH.SENT);
+        if (refused.length) researchLog.setPublishState(refused, PUBLISH.REJECTED);
         fails = 0;
         nextTry = 0;
-        setCommunityStatus({ sent: communityStatus().sent + (Number(res.accepted) || 0), lastSend: Date.now(), sendError: null, authError: false });
+        const accepted = Number(res.accepted) || 0;
+        const patch = { sent: communityStatus().sent + accepted, sendError: null, authError: false };
+        if (accepted) patch.lastSend = Date.now();
+        if (waiting.length) { // over the daily quota: these stay PENDING, and nothing more is sent until it resets
+          setCommunityStatus({ ...patch, quotaUntil: quotaResetAt(res) });
+          result = 'quota';
+          break;
+        }
+        setCommunityStatus({ ...patch, quotaUntil: 0 });
         result = 'sent';
       } catch (e) {
         if (e.auth) {
@@ -240,8 +300,16 @@ export function startPublisher() {
   if (typeof window !== 'undefined') window.addEventListener('online', () => { resetBackoff(); flush(); });
   on('log:changed', () => { if (researchLog.pendingCount()) schedule(); });
   on('community:feed', queueVotesForListed);
-  on('settings:changed', () => { resetBackoff(); if (communityStatus().authError) setCommunityStatus({ authError: false }); flush(); });
+  on('settings:changed', (prev) => {
+    resetBackoff();
+    const st = communityStatus();
+    const patch = {};
+    if (st.authError) patch.authError = false;
+    if (st.quotaUntil && prev && prev.communityUrl !== settings.communityUrl) patch.quotaUntil = 0; // another server, another quota
+    if (Object.keys(patch).length) setCommunityStatus(patch);
+    flush();
+  });
 }
 
 /** For tests / diagnostics. */
-export const publisherState = () => ({ busy, fails, nextTry, queued: queuedCount() });
+export const publisherState = () => ({ busy, fails, nextTry, queued: queuedCount(), quotaUntil: quotaHeldUntil() });

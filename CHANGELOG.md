@@ -2,6 +2,12 @@
 
 All notable changes to this project. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **Reports over the server's daily quota are no longer lost.** The server marks them with `code: "quota"` and says when the quota resets; the userscript keeps them queued, shows *Daily sharing limit reached – N reports kept…* in the footer and Settings, and sends them after the reset. Before, they were marked rejected and never sent.
+- Rejections in the `POST /v1/reports` response now give the report's position in the request (it was off by the number of jokes dropped earlier in the same batch), and each has a `code` (`quota`, `invalid` or `joke`).
+
 ## [2.0.0] – offline-first, restructured project
 
 ### Added

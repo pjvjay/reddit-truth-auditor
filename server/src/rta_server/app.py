@@ -152,11 +152,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/v1/reports", dependencies=[Depends(rate_limit), Depends(check_token)])
     def post_reports(batch: ReportBatch):
-        """Submit a batch of audited claims. Only claims meant as fact are accepted (jokes/satire not passed off as fact are ignored)."""
-        ok, skipped = [], []
+        """
+        Submit a batch of audited claims. Only claims meant as fact are accepted (jokes/satire not passed off as fact are ignored).
+
+        Returns `accepted`, `keys`, `quota` (`limit`, `used`, `remaining`, `resets_at` in epoch seconds) and `rejected`:
+        one `{index, code, reason}` per report that was not stored, where `index` is its position in the request and
+        `code` is `quota` (over the daily quota - send it again after `quota.resets_at`), `invalid` or `joke`.
+        """
+        ok, positions, skipped = [], [], []
         for i, r in enumerate(batch.reports):
             if r.tone in ("humorous", "satirical") and not r.presented_as_fact:
-                skipped.append({"index": i, "reason": "joke/satire not presented as fact"})
+                skipped.append({"index": i, "code": "joke", "reason": "joke/satire not presented as fact"})
                 continue
             d = r.model_dump()
             for k in ("source", "attributed", "engagement"):
@@ -166,8 +172,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if d["claim"].get("topic") not in TOPICS:
                 d["claim"]["topic"] = "other"
             ok.append(d)
+            positions.append(i)
         res = store.ingest(batch.client, ok)
-        res["rejected"] = skipped + res["rejected"]
+        # ingest numbers its rejections within `ok`; clients need the position in the request they sent
+        stored = [{**x, "index": positions[x["index"]]} for x in res["rejected"]]
+        res["rejected"] = sorted(skipped + stored, key=lambda x: x["index"])
         return res
 
     @app.post("/v1/canonicalize")

@@ -71,9 +71,9 @@ docs/                user & developer documentation
 npm install
 npm run build          # dist/reddit-truth-auditor.user.js
 npm run lint
-npm run test:unit      # 35 unit tests (no browser)
+npm run test:unit      # 40 unit tests (no browser)
 npm run test:e2e       # 34 end-to-end scenarios in headless Chromium (needs: pip install playwright fastapi httpx)
-npm run test:server    # 32 server tests (pip install -e "server[dev]")
+npm run test:server    # 34 server tests (pip install -e "server[dev]")
 ```
 
 See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
