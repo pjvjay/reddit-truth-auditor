@@ -1,0 +1,450 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pjvjay/reddit-truth-auditor/spec/report.schema.json",
+  "$defs": {
+    "Attributed": {
+      "description": "An outlet the post cites in its text (\"according to Fox News ...\").",
+      "properties": {
+        "outlet": {
+          "maxLength": 80,
+          "title": "Outlet",
+          "type": "string"
+        },
+        "kind": {
+          "default": "unknown",
+          "enum": [
+            "news",
+            "opinion",
+            "analysis",
+            "video",
+            "social",
+            "blog",
+            "unknown"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "outlet"
+      ],
+      "title": "Attributed",
+      "type": "object"
+    },
+    "Claim": {
+      "description": "Canonical claim structure (rta.claim/1) - see server/README.md.",
+      "properties": {
+        "subject": {
+          "maxLength": 200,
+          "title": "Subject",
+          "type": "string"
+        },
+        "predicate": {
+          "default": "",
+          "maxLength": 80,
+          "title": "Predicate",
+          "type": "string"
+        },
+        "object": {
+          "default": "",
+          "maxLength": 300,
+          "title": "Object",
+          "type": "string"
+        },
+        "polarity": {
+          "default": "affirms",
+          "enum": [
+            "affirms",
+            "denies"
+          ],
+          "title": "Polarity",
+          "type": "string"
+        },
+        "quantities": {
+          "items": {
+            "$ref": "#/$defs/Quantity"
+          },
+          "maxItems": 8,
+          "title": "Quantities",
+          "type": "array"
+        },
+        "time": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time"
+        },
+        "place": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Place"
+        },
+        "topic": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "other",
+          "title": "Topic"
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "title": "Claim",
+      "type": "object"
+    },
+    "Engagement": {
+      "description": "Public popularity snapshot of the Reddit post when it was seen.",
+      "properties": {
+        "score": {
+          "default": 0,
+          "maximum": 100000000,
+          "minimum": -1000000,
+          "title": "Score",
+          "type": "integer"
+        },
+        "comments": {
+          "default": 0,
+          "maximum": 100000000,
+          "minimum": 0,
+          "title": "Comments",
+          "type": "integer"
+        },
+        "upvote_ratio": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Upvote Ratio"
+        },
+        "crossposts": {
+          "default": 0,
+          "maximum": 10000000,
+          "minimum": 0,
+          "title": "Crossposts",
+          "type": "integer"
+        },
+        "subscribers": {
+          "default": 0,
+          "maximum": 1000000000,
+          "minimum": 0,
+          "title": "Subscribers",
+          "type": "integer"
+        }
+      },
+      "title": "Engagement",
+      "type": "object"
+    },
+    "Quantity": {
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Value"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "Quantity",
+      "type": "object"
+    },
+    "Report": {
+      "properties": {
+        "claim": {
+          "$ref": "#/$defs/Claim"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "client-computed proposition key (informational; the server recomputes it)",
+          "title": "Key"
+        },
+        "claim_truth": {
+          "description": "truth of the claim AS STATED by the post (0-10)",
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Claim Truth",
+          "type": "number"
+        },
+        "confidence": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        },
+        "tone": {
+          "default": "sincere",
+          "enum": [
+            "sincere",
+            "sarcastic",
+            "humorous",
+            "satirical",
+            "unclear"
+          ],
+          "title": "Tone",
+          "type": "string"
+        },
+        "presented_as_fact": {
+          "default": false,
+          "title": "Presented As Fact",
+          "type": "boolean"
+        },
+        "researched": {
+          "default": false,
+          "title": "Researched",
+          "type": "boolean"
+        },
+        "sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 5,
+          "title": "Sources",
+          "type": "array"
+        },
+        "verdict": {
+          "default": "",
+          "maxLength": 400,
+          "title": "Verdict",
+          "type": "string"
+        },
+        "model": {
+          "default": "",
+          "maxLength": 60,
+          "title": "Model",
+          "type": "string"
+        },
+        "post": {
+          "description": "sha256('rta1:' + reddit post id)[:32]",
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Post",
+          "type": "string"
+        },
+        "subreddit": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9_]{2,21}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subreddit"
+        },
+        "url_hash": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "sha256('rta1:' + normalised link)[:32]",
+          "title": "Url Hash"
+        },
+        "day": {
+          "anyOf": [
+            {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Day"
+        },
+        "origin": {
+          "default": "audit",
+          "enum": [
+            "audit",
+            "local",
+            "community"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Source"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "attributed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Attributed"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "engagement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Engagement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "post_day": {
+          "anyOf": [
+            {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "UTC day the Reddit post was created",
+          "title": "Post Day"
+        }
+      },
+      "required": [
+        "claim",
+        "claim_truth",
+        "post"
+      ],
+      "title": "Report",
+      "type": "object"
+    },
+    "Source": {
+      "description": "Where the post's link points (host only - never the path).",
+      "properties": {
+        "domain": {
+          "pattern": "^[a-z0-9.-]{3,253}$",
+          "title": "Domain",
+          "type": "string"
+        },
+        "kind": {
+          "default": "unknown",
+          "enum": [
+            "news",
+            "opinion",
+            "analysis",
+            "video",
+            "social",
+            "blog",
+            "unknown"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "title": "Source",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema": {
+      "const": "rta.report/1",
+      "default": "rta.report/1",
+      "title": "Schema",
+      "type": "string"
+    },
+    "client": {
+      "description": "random, user-resettable install id",
+      "pattern": "^c_[0-9a-f]{32}$",
+      "title": "Client",
+      "type": "string"
+    },
+    "reports": {
+      "items": {
+        "$ref": "#/$defs/Report"
+      },
+      "maxItems": 100,
+      "title": "Reports",
+      "type": "array"
+    }
+  },
+  "required": [
+    "client",
+    "reports"
+  ],
+  "title": "rta.report/1",
+  "type": "object"
+}

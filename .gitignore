@@ -1,19 +1,31 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 *.egg-info/
-dist/
 build/
 .pytest_cache/
+
+# Node
+node_modules/
+
+# secrets & local data
 .env
 .env.*
 !.env.example
-.DS_Store
-.claude/
+*.sqlite3
+*.sqlite3-*
+*.csv
 *.log
 *.jsonl
 logs/
 
-*.csv
+# test output
+userscript/test/e2e/screenshots/
 
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/

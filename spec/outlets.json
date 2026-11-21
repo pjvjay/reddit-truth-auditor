@@ -1,0 +1,624 @@
+{
+  "$comment": "Outlet registry shared by the community server (rta_server/outlets.py) and the userscript's offline clustering. Ownership group = unit of independence. tier: 1 major national/international, 2 established, 3 small/unknown (reach, not quality or lean). Review ownership periodically - it changes.",
+  "schema": "rta.outlets/1",
+  "tier_weight": {
+    "1": 1.0,
+    "2": 0.7,
+    "3": 0.4
+  },
+  "platform_weight": 0.25,
+  "multi_part_suffixes": [
+    "ac.uk",
+    "co.in",
+    "co.jp",
+    "co.kr",
+    "co.nz",
+    "co.uk",
+    "co.za",
+    "com.ar",
+    "com.au",
+    "com.br",
+    "com.cn",
+    "com.hk",
+    "com.mx",
+    "com.sg",
+    "com.tr",
+    "gov.uk",
+    "net.au",
+    "org.au",
+    "org.uk"
+  ],
+  "outlets": {
+    "reuters.com": {
+      "name": "Reuters",
+      "group": "Thomson Reuters",
+      "tier": 1,
+      "type": "wire"
+    },
+    "apnews.com": {
+      "name": "Associated Press",
+      "group": "Associated Press",
+      "tier": 1,
+      "type": "wire"
+    },
+    "afp.com": {
+      "name": "AFP",
+      "group": "Agence France-Presse",
+      "tier": 1,
+      "type": "wire"
+    },
+    "bloomberg.com": {
+      "name": "Bloomberg",
+      "group": "Bloomberg L.P.",
+      "tier": 1,
+      "type": "news"
+    },
+    "cnn.com": {
+      "name": "CNN",
+      "group": "Warner Bros. Discovery",
+      "tier": 1,
+      "type": "news"
+    },
+    "foxnews.com": {
+      "name": "Fox News",
+      "group": "Fox Corporation",
+      "tier": 1,
+      "type": "news"
+    },
+    "foxbusiness.com": {
+      "name": "Fox Business",
+      "group": "Fox Corporation",
+      "tier": 2,
+      "type": "news"
+    },
+    "nytimes.com": {
+      "name": "The New York Times",
+      "group": "The New York Times Company",
+      "tier": 1,
+      "type": "news"
+    },
+    "washingtonpost.com": {
+      "name": "The Washington Post",
+      "group": "Nash Holdings",
+      "tier": 1,
+      "type": "news"
+    },
+    "wsj.com": {
+      "name": "The Wall Street Journal",
+      "group": "News Corp",
+      "tier": 1,
+      "type": "news"
+    },
+    "nypost.com": {
+      "name": "New York Post",
+      "group": "News Corp",
+      "tier": 2,
+      "type": "tabloid"
+    },
+    "usatoday.com": {
+      "name": "USA Today",
+      "group": "Gannett",
+      "tier": 1,
+      "type": "news"
+    },
+    "nbcnews.com": {
+      "name": "NBC News",
+      "group": "Comcast",
+      "tier": 1,
+      "type": "news"
+    },
+    "msnbc.com": {
+      "name": "MSNBC",
+      "group": "Versant",
+      "tier": 1,
+      "type": "news"
+    },
+    "cnbc.com": {
+      "name": "CNBC",
+      "group": "Versant",
+      "tier": 2,
+      "type": "news"
+    },
+    "cbsnews.com": {
+      "name": "CBS News",
+      "group": "Paramount Skydance",
+      "tier": 1,
+      "type": "news"
+    },
+    "abcnews.go.com": {
+      "name": "ABC News (US)",
+      "group": "The Walt Disney Company",
+      "tier": 1,
+      "type": "news"
+    },
+    "npr.org": {
+      "name": "NPR",
+      "group": "NPR",
+      "tier": 1,
+      "type": "public"
+    },
+    "pbs.org": {
+      "name": "PBS",
+      "group": "PBS",
+      "tier": 2,
+      "type": "public"
+    },
+    "politico.com": {
+      "name": "Politico",
+      "group": "Axel Springer",
+      "tier": 2,
+      "type": "news"
+    },
+    "businessinsider.com": {
+      "name": "Business Insider",
+      "group": "Axel Springer",
+      "tier": 2,
+      "type": "digital"
+    },
+    "axios.com": {
+      "name": "Axios",
+      "group": "Cox Enterprises",
+      "tier": 2,
+      "type": "digital"
+    },
+    "thehill.com": {
+      "name": "The Hill",
+      "group": "Nexstar Media Group",
+      "tier": 2,
+      "type": "news"
+    },
+    "newsweek.com": {
+      "name": "Newsweek",
+      "group": "Newsweek Digital",
+      "tier": 2,
+      "type": "magazine"
+    },
+    "time.com": {
+      "name": "TIME",
+      "group": "TIME USA",
+      "tier": 2,
+      "type": "magazine"
+    },
+    "theatlantic.com": {
+      "name": "The Atlantic",
+      "group": "Emerson Collective",
+      "tier": 2,
+      "type": "magazine"
+    },
+    "latimes.com": {
+      "name": "Los Angeles Times",
+      "group": "Nant Capital",
+      "tier": 2,
+      "type": "news"
+    },
+    "huffpost.com": {
+      "name": "HuffPost",
+      "group": "BuzzFeed",
+      "tier": 2,
+      "type": "digital"
+    },
+    "buzzfeednews.com": {
+      "name": "BuzzFeed News",
+      "group": "BuzzFeed",
+      "tier": 2,
+      "type": "digital"
+    },
+    "vox.com": {
+      "name": "Vox",
+      "group": "Vox Media",
+      "tier": 2,
+      "type": "digital"
+    },
+    "breitbart.com": {
+      "name": "Breitbart",
+      "group": "Breitbart News Network",
+      "tier": 2,
+      "type": "digital"
+    },
+    "dailywire.com": {
+      "name": "The Daily Wire",
+      "group": "The Daily Wire",
+      "tier": 2,
+      "type": "digital"
+    },
+    "theblaze.com": {
+      "name": "TheBlaze",
+      "group": "Blaze Media",
+      "tier": 3,
+      "type": "digital"
+    },
+    "newsmax.com": {
+      "name": "Newsmax",
+      "group": "Newsmax Media",
+      "tier": 2,
+      "type": "news"
+    },
+    "oann.com": {
+      "name": "One America News",
+      "group": "Herring Networks",
+      "tier": 3,
+      "type": "news"
+    },
+    "thegatewaypundit.com": {
+      "name": "The Gateway Pundit",
+      "group": "The Gateway Pundit",
+      "tier": 3,
+      "type": "digital"
+    },
+    "motherjones.com": {
+      "name": "Mother Jones",
+      "group": "Foundation for National Progress",
+      "tier": 3,
+      "type": "magazine"
+    },
+    "theintercept.com": {
+      "name": "The Intercept",
+      "group": "First Look Institute",
+      "tier": 3,
+      "type": "digital"
+    },
+    "forbes.com": {
+      "name": "Forbes",
+      "group": "Forbes Media",
+      "tier": 2,
+      "type": "magazine"
+    },
+    "bbc.co.uk": {
+      "name": "BBC",
+      "group": "BBC",
+      "tier": 1,
+      "type": "public"
+    },
+    "bbc.com": {
+      "name": "BBC",
+      "group": "BBC",
+      "tier": 1,
+      "type": "public"
+    },
+    "theguardian.com": {
+      "name": "The Guardian",
+      "group": "Guardian Media Group",
+      "tier": 1,
+      "type": "news"
+    },
+    "telegraph.co.uk": {
+      "name": "The Telegraph",
+      "group": "Telegraph Media Group",
+      "tier": 1,
+      "type": "news"
+    },
+    "thetimes.co.uk": {
+      "name": "The Times",
+      "group": "News Corp",
+      "tier": 1,
+      "type": "news"
+    },
+    "thesun.co.uk": {
+      "name": "The Sun",
+      "group": "News Corp",
+      "tier": 1,
+      "type": "tabloid"
+    },
+    "dailymail.co.uk": {
+      "name": "Daily Mail",
+      "group": "DMG Media",
+      "tier": 1,
+      "type": "tabloid"
+    },
+    "mirror.co.uk": {
+      "name": "Daily Mirror",
+      "group": "Reach plc",
+      "tier": 2,
+      "type": "tabloid"
+    },
+    "express.co.uk": {
+      "name": "Daily Express",
+      "group": "Reach plc",
+      "tier": 2,
+      "type": "tabloid"
+    },
+    "independent.co.uk": {
+      "name": "The Independent",
+      "group": "Independent Digital News & Media",
+      "tier": 2,
+      "type": "news"
+    },
+    "sky.com": {
+      "name": "Sky News",
+      "group": "Comcast",
+      "tier": 1,
+      "type": "news"
+    },
+    "ft.com": {
+      "name": "Financial Times",
+      "group": "Nikkei",
+      "tier": 1,
+      "type": "news"
+    },
+    "gbnews.com": {
+      "name": "GB News",
+      "group": "All Perspectives Ltd",
+      "tier": 2,
+      "type": "news"
+    },
+    "irishtimes.com": {
+      "name": "The Irish Times",
+      "group": "The Irish Times DAC",
+      "tier": 2,
+      "type": "news"
+    },
+    "cbc.ca": {
+      "name": "CBC",
+      "group": "CBC/Radio-Canada",
+      "tier": 1,
+      "type": "public"
+    },
+    "ctvnews.ca": {
+      "name": "CTV News",
+      "group": "Bell Media",
+      "tier": 1,
+      "type": "news"
+    },
+    "globalnews.ca": {
+      "name": "Global News",
+      "group": "Corus Entertainment",
+      "tier": 1,
+      "type": "news"
+    },
+    "theglobeandmail.com": {
+      "name": "The Globe and Mail",
+      "group": "Woodbridge",
+      "tier": 1,
+      "type": "news"
+    },
+    "nationalpost.com": {
+      "name": "National Post",
+      "group": "Postmedia",
+      "tier": 2,
+      "type": "news"
+    },
+    "torontosun.com": {
+      "name": "Toronto Sun",
+      "group": "Postmedia",
+      "tier": 2,
+      "type": "tabloid"
+    },
+    "thestar.com": {
+      "name": "Toronto Star",
+      "group": "Nordstar Capital",
+      "tier": 2,
+      "type": "news"
+    },
+    "rebelnews.com": {
+      "name": "Rebel News",
+      "group": "Rebel News Network",
+      "tier": 3,
+      "type": "digital"
+    },
+    "abc.net.au": {
+      "name": "ABC (Australia)",
+      "group": "Australian Broadcasting Corporation",
+      "tier": 1,
+      "type": "public"
+    },
+    "smh.com.au": {
+      "name": "Sydney Morning Herald",
+      "group": "Nine Entertainment",
+      "tier": 1,
+      "type": "news"
+    },
+    "news.com.au": {
+      "name": "news.com.au",
+      "group": "News Corp",
+      "tier": 1,
+      "type": "digital"
+    },
+    "skynews.com.au": {
+      "name": "Sky News Australia",
+      "group": "News Corp",
+      "tier": 2,
+      "type": "news"
+    },
+    "nzherald.co.nz": {
+      "name": "NZ Herald",
+      "group": "NZME",
+      "tier": 2,
+      "type": "news"
+    },
+    "aljazeera.com": {
+      "name": "Al Jazeera",
+      "group": "Al Jazeera Media Network",
+      "tier": 1,
+      "type": "news"
+    },
+    "dw.com": {
+      "name": "Deutsche Welle",
+      "group": "Deutsche Welle",
+      "tier": 1,
+      "type": "public"
+    },
+    "france24.com": {
+      "name": "France 24",
+      "group": "France Médias Monde",
+      "tier": 1,
+      "type": "public"
+    },
+    "euronews.com": {
+      "name": "Euronews",
+      "group": "Alpac Capital",
+      "tier": 2,
+      "type": "news"
+    },
+    "rt.com": {
+      "name": "RT",
+      "group": "Russian state media",
+      "tier": 2,
+      "type": "state"
+    },
+    "sputnikglobe.com": {
+      "name": "Sputnik",
+      "group": "Russian state media",
+      "tier": 2,
+      "type": "state"
+    },
+    "tass.com": {
+      "name": "TASS",
+      "group": "Russian state media",
+      "tier": 2,
+      "type": "state"
+    },
+    "cgtn.com": {
+      "name": "CGTN",
+      "group": "Chinese state media",
+      "tier": 2,
+      "type": "state"
+    },
+    "globaltimes.cn": {
+      "name": "Global Times",
+      "group": "Chinese state media",
+      "tier": 2,
+      "type": "state"
+    },
+    "presstv.ir": {
+      "name": "Press TV",
+      "group": "Iranian state media",
+      "tier": 3,
+      "type": "state"
+    },
+    "timesofindia.indiatimes.com": {
+      "name": "Times of India",
+      "group": "Bennett, Coleman & Co.",
+      "tier": 1,
+      "type": "news"
+    },
+    "ndtv.com": {
+      "name": "NDTV",
+      "group": "Adani Group",
+      "tier": 2,
+      "type": "news"
+    },
+    "scmp.com": {
+      "name": "South China Morning Post",
+      "group": "Alibaba Group",
+      "tier": 1,
+      "type": "news"
+    },
+    "theonion.com": {
+      "name": "The Onion",
+      "group": "Global Tetrahedron",
+      "tier": 2,
+      "type": "satire"
+    },
+    "babylonbee.com": {
+      "name": "The Babylon Bee",
+      "group": "The Babylon Bee",
+      "tier": 2,
+      "type": "satire"
+    },
+    "youtube.com": {
+      "name": "YouTube",
+      "group": "YouTube",
+      "tier": 3,
+      "type": "video"
+    },
+    "youtu.be": {
+      "name": "YouTube",
+      "group": "YouTube",
+      "tier": 3,
+      "type": "video"
+    },
+    "rumble.com": {
+      "name": "Rumble",
+      "group": "Rumble",
+      "tier": 3,
+      "type": "video"
+    },
+    "bitchute.com": {
+      "name": "BitChute",
+      "group": "BitChute",
+      "tier": 3,
+      "type": "video"
+    },
+    "tiktok.com": {
+      "name": "TikTok",
+      "group": "TikTok",
+      "tier": 3,
+      "type": "social"
+    },
+    "x.com": {
+      "name": "X",
+      "group": "X",
+      "tier": 3,
+      "type": "social"
+    },
+    "twitter.com": {
+      "name": "X",
+      "group": "X",
+      "tier": 3,
+      "type": "social"
+    },
+    "facebook.com": {
+      "name": "Facebook",
+      "group": "Meta",
+      "tier": 3,
+      "type": "social"
+    },
+    "instagram.com": {
+      "name": "Instagram",
+      "group": "Meta",
+      "tier": 3,
+      "type": "social"
+    },
+    "threads.net": {
+      "name": "Threads",
+      "group": "Meta",
+      "tier": 3,
+      "type": "social"
+    },
+    "truthsocial.com": {
+      "name": "Truth Social",
+      "group": "Trump Media & Technology Group",
+      "tier": 3,
+      "type": "social"
+    },
+    "t.me": {
+      "name": "Telegram",
+      "group": "Telegram",
+      "tier": 3,
+      "type": "social"
+    },
+    "substack.com": {
+      "name": "Substack",
+      "group": "Substack",
+      "tier": 3,
+      "type": "blog"
+    },
+    "medium.com": {
+      "name": "Medium",
+      "group": "Medium",
+      "tier": 3,
+      "type": "blog"
+    }
+  },
+  "aliases": {
+    "abc news": "abcnews.go.com",
+    "ap": "apnews.com",
+    "bbc news": "bbc.co.uk",
+    "cbs": "cbsnews.com",
+    "ctv": "ctvnews.ca",
+    "fox": "foxnews.com",
+    "guardian": "theguardian.com",
+    "nbc": "nbcnews.com",
+    "new york times": "nytimes.com",
+    "ny post": "nypost.com",
+    "ny times": "nytimes.com",
+    "nyt": "nytimes.com",
+    "russia today": "rt.com",
+    "telegraph": "telegraph.co.uk",
+    "twitter": "x.com",
+    "wall street journal": "wsj.com",
+    "wapo": "washingtonpost.com",
+    "washington post": "washingtonpost.com",
+    "wsj": "wsj.com"
+  }
+}

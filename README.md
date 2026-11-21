@@ -1,108 +1,90 @@
-# reddit-truth-auditor
+# Reddit Truth Auditor
 
-**AI-powered Reddit post truthfulness scorer using GPT-4o-mini and autonomous research agents.**
+**Fact-checks the Reddit posts you're looking at, and warns you when something is false or misleading.**
 
-Fetches posts from configurable subreddits, runs them through a multi-stage LLM pipeline to evaluate factual accuracy, and saves the worst offenders to a structured CSV audit log.
+A browser userscript (Tampermonkey / Violentmonkey) that quietly checks posts as you scroll. It:
+
+- extracts the claim, researches it on the web and scores it;
+- slides open a side panel when a post looks risky;
+- understands sarcasm and satire;
+- never pays twice for the same claim, thanks to a local research log.
+
+An optional, self-hostable **community server** lets users pool anonymous reports. The server tracks how often each falsehood spreads, and across which outlets (CNN, Fox News, BBC…). It clusters related lies into **narratives ranked by severity** and shares the agreed list back to every user.
+
+Everything works **offline-first**: analyses are stored locally and reports are published whenever the server is reachable.
+
+![Side panel flagging a false post](docs/images/panel-flagged.png)
+
+## Install
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Edge, Firefox, Safari, Opera) or [Violentmonkey](https://violentmonkey.github.io/).
+   In Chrome/Edge also switch on **Allow User Scripts** (Extensions → Tampermonkey → Details).
+2. **[Install the userscript](https://raw.githubusercontent.com/pjvjay/reddit-truth-auditor/main/dist/reddit-truth-auditor.user.js)** and click *Install*. It updates automatically.
+3. Open [reddit.com](https://www.reddit.com). Paste an **OpenAI API key** (plus, optionally, a free [Tavily](https://tavily.com) key for live web research), then press **Save**.
+
+That's it – browse normally. **Alt+Shift+R** toggles the panel.
 
 ## Features
 
-- **Multi-stage analysis** — factual check, context check, and verdict summary per post
-- **Autonomous deep research** — `finalrun.py` uses [GPT-Researcher](https://github.com/assafelovic/gpt-researcher) to conduct real web research before scoring
-- **LangChain pipeline** — structured JSON output via prompt chaining and `JsonOutputParser`
-- **Cost tracking** — token usage and USD cost logged per run
-- **CSV audit log** — scored posts saved with date, subreddit, score, reasoning, and URL
+| | |
+|---|---|
+| **Checks what you read** | Posts that stay on screen about a second are checked. The steps are claim extraction, then web research, then a verdict with sources. Works on new Reddit and old.reddit.com. |
+| **Configurable alerts** | The panel opens when a post's risk crosses your threshold. Each post gets a status badge. |
+| **Humour, sarcasm & satire** | Sarcasm is decoded and the intended meaning is checked. Evident satire is discounted, but satire passed off as news is flagged. |
+| **Research log** | Every result is kept locally (30 days). It covers reposts, crossposts, same link, near-identical text, same claim and opposite stance. A History tab and CSV export are included. |
+| **Cost controls** | Daily spend cap, dwell time, parallel checks, subreddit filters and pause. Typical cost is about $0.0005 per checked claim with `gpt-4o-mini`. |
+| **Community network** *(opt-in)* | Anonymous reports of mistruths go to a shared list, matched **on your device**. Known lies cost few or no tokens. |
+| **Narratives** | False claims are clustered into event narratives, weighted by independent outlets, post popularity, spread and growth. View them community-wide or from your own history, offline. |
+| **Private by design** | No accounts and no tracking. Keys stay in your userscript manager, the community feature is opt-in, and the exact payload is viewable in Settings. |
 
-## Requirements
+More: [userscript guide](docs/userscript.md) · [privacy](docs/privacy.md) · [community API & clustering](docs/community-api.md) · [architecture](docs/architecture.md)
 
-- Python 3.10+
-- OpenAI API key
-- (For `finalrun.py`) `TAVILY_API_KEY` for GPT-Researcher web search
+<img src="docs/images/panel-trends.png" alt="Trends: propagating false narratives" width="720">
 
-## Quick Start
+## Community server (optional)
 
 ```bash
-git clone https://github.com/pjvjay/reddit-truth-auditor
-cd reddit-truth-auditor
-
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Add your OPENAI_API_KEY (and TAVILY_API_KEY for finalrun.py)
-
-python finalrun.py
+pip install ./server            # or: docker build -f server/Dockerfile -t rta-community-server .
+rta-server --host 0.0.0.0 --port 8080
 ```
 
-## Scripts
+Then point the userscript at it under *Settings → Community network*. See [server/README.md](server/README.md) for deployment and configuration, and [docs/community-api.md](docs/community-api.md) for the protocol, consensus, clustering and severity model.
 
-Three iterations, each more powerful than the last:
-
-### `run.py` — Basic scorer
-Fetches posts from a subreddit and scores them 0–10 for truthfulness using a single GPT-4o-mini prompt. Outputs results to `reddit_truth_audit.csv`.
-
-### `run2.py` — Multi-component reasoning
-Breaks analysis into three structured components returned as JSON:
-- `factual_check` — verifies specific numbers, laws, and claims
-- `context_check` — evaluates how the post fits the current policy landscape
-- `verdict_summary` — one-sentence conclusion
-
-Targets configurable subreddits (default: Canadian immigration/policy communities).
-
-### `finalrun.py` — Deep research pipeline *(recommended)*
-Uses [GPT-Researcher](https://github.com/assafelovic/gpt-researcher) to autonomously research each post's core claim on the web before scoring. Pipeline:
+## Repository layout
 
 ```
-Reddit post
-    ↓
-LangChain: extract verifiable claim + search query
-    ↓
-GPT-Researcher: autonomous web research (5–10 sources)
-    ↓
-LangChain: audit claim against research report
-    ↓
-JSON output: truth_score, sarcasm_score, factual_check, verdict
-    ↓
-CSV: final_policy_audit.csv
+userscript/          the browser userscript
+  src/               ES modules: core, text, reddit, analysis, store, community, insights, pipeline, ui
+  build.mjs          esbuild -> dist/
+  test/unit/         Node unit tests (node --test)
+  test/e2e/          Playwright end-to-end tests (mock Reddit, mock OpenAI/Tavily, real server in-process)
+dist/                built, installable userscript (+ .meta.js for update checks)
+server/              community API - Python package `rta_server` (FastAPI + SQLite)
+spec/                language-neutral contracts: JSON Schemas, outlet registry, cross-language test vectors
+batch/               the original command-line batch scripts (finalrun.py pipeline)
+docs/                user & developer documentation
 ```
 
-## Configuration
+## Development
 
-Edit the `TARGET_SUBS` list at the top of each script:
-
-```python
-TARGET_SUBS = ['lmiascams', 'destiny', 'canadian', 'askcanada', 'vancouverjobs']
+```bash
+npm install
+npm run build          # dist/reddit-truth-auditor.user.js
+npm run lint
+npm run test:unit      # 51 unit tests (no browser)
+npm run test:e2e       # 34 end-to-end scenarios in headless Chromium (needs: pip install playwright fastapi httpx)
+npm run test:server    # 36 server tests (pip install -e "server[dev]")
 ```
 
-Environment variables (`.env`):
-```
-OPENAI_API_KEY=sk-...
-TAVILY_API_KEY=tvly-...   # required for finalrun.py
-```
+See [docs/development.md](docs/development.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Output
+## Limitations
 
-CSV columns (finalrun.py):
+- **AI fact-checks can be wrong.** Treat the panel as a prompt to look closer, and check the cited sources.
+- **Web research matters.** Without a Tavily key, verdicts on recent news are marked as unverified rather than false.
+- **Text only.** Only post titles and bodies are checked, not comments, images or video.
+- **Reddit markup changes.** Reddit changes its page structure from time to time; if badges stop appearing, update the script.
 
-| Column | Description |
-|---|---|
-| `date` | Run date |
-| `score` | Truthfulness score 0–10 (lower = less truthful) |
-| `subreddit` | Source subreddit |
-| `title` | Post title |
-| `factual_check` | Specific fact verification from research |
-| `context_check` | How claim fits current policy/news context |
-| `verdict` | One-sentence final assessment |
-| `url` | Direct link to Reddit post |
+## License
 
-## Project Structure
-
-```
-reddit-truth-auditor/
-├── run.py            # Basic GPT scorer
-├── run2.py           # Multi-component reasoning scorer
-├── finalrun.py       # Full research pipeline (recommended)
-├── requirements.txt
-├── .env.example
-└── *.csv             # Audit output (gitignored)
-```
+[MIT](LICENSE)
