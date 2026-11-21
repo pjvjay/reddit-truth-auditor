@@ -28,15 +28,33 @@ That's it – browse normally.
 | | |
 |---|---|
 | **Watches what you read** | A post is checked once it has been on screen for ~1 s (configurable), so fast scrolling doesn't burn credits. Works on the new Reddit UI, `old.reddit.com`, feeds, subreddits and post pages. |
-| **Same pipeline as `finalrun.py`** | ① LLM extracts the verifiable claim + search query → ② Tavily web research (the search engine GPT-Researcher uses) → ③ LLM audit returning `truth_score`, `sarcasm_score`, `factual_check`, `context_check`, `verdict`. Opinions, questions and memes are skipped after step ①. |
+| **Same pipeline as `finalrun.py`** | ① LLM extracts the verifiable claim + search query → ② Tavily web research (the search engine GPT-Researcher uses) → ③ LLM audit returning `truth_score`, `satire_score`, `tone`, `presented_as_fact`, `factual_check`, `context_check`, `verdict`. Opinions, questions and memes are skipped after step ①. |
 | **Side panel** | A glassy panel slides in from the right (25 % of the screen, min 340 px) with a spinning card for every post being researched (*Claim → Research → Verdict*), then a risk gauge, verdict, sources and “Show post” for each result. |
-| **Configurable risk alert** | `risk = 100 − truth_score × 10`. The panel **auto-opens when a post at or above your threshold is on screen** (default 60 % ⇔ truth ≤ 4/10). Satire/jokes are not flagged by default. |
+| **Configurable risk alert** | `risk = 100 − truth_score × 10`. The panel **auto-opens when a post at or above your threshold is on screen** (default 60 % ⇔ truth ≤ 4/10). |
+| **Understands humour, sarcasm & satire** | Sarcasm is decoded so the author's *intended* meaning is fact-checked; evident satire and jokes are discounted; satire **passed off as real news** is flagged. See [below](#humour-sarcasm--satire). |
 | **Badges on posts** | Each checked post gets a small pill (*Fact-checking… / Looks accurate / Misleading? / Likely false*), and flagged posts get a red edge. Click a pill to open its card. |
 | **Research log – never pays twice** | Every analysed post (scores, verdict, sources) is kept in a local log (30 days / 5,000 posts by default, shared across tabs). Posts already in the log are never re-analysed, and reposts are recognised – see below. A **History** tab lets you browse/search the log and shows how much was saved. |
 | **Cost controls** | Daily spend cap (default $0.50), parallel-check limit, pause button, subreddit allow/block lists. Today's spend and reuse count are shown in the panel footer. |
-| **CSV export** | Download the research log as CSV (same columns as `final_policy_audit.csv`, plus risk, sources and `reused_from` / `reuse_via`). |
+| **CSV export** | Download the research log as CSV (same columns as `final_policy_audit.csv`, plus risk, sources, `reused_from` / `reuse_via` and `tone` / `presented_as_fact` / `effective_risk`). |
 
 <img src="userscript/docs/panel-researching.png" alt="Posts being researched" width="720">
+
+### Humour, sarcasm & satire
+
+Tone is judged from free local signals first, then by the model (extraction step) and again by the audit with the web research in hand (e.g. results revealing that a story originates from a satire site).
+
+**Local signals (free):** ~25 known satire sites (The Onion, Babylon Bee, The Beaverton, ClickHole, Borowitz Report, NewsThump, Der Postillon…), satire subreddits (r/TheOnion, r/BabylonBee, r/\*circlejerk, r/SubredditSimulator…), humour/meme subreddits, `/s` · `/j` tone markers, “[Satire]” title labels and humour flairs. r/nottheonion is recognised as *real* news that only sounds absurd. These hints are passed to the model.
+
+| Tone | What happens | Risk used for alerts |
+|---|---|---|
+| **Sincere** | Normal fact-check | full |
+| **Sarcastic** | The model rewrites the claim to what the author actually means (“vaccines *totally* contain microchips /s” → “vaccines do not contain microchips”) and that is audited – no false alarm for people mocking a myth | full (of the intended meaning) |
+| **Satire / joke, evident** | Posts in satire subreddits are skipped **without any API call**; other evident jokes stop after the cheap extraction call (no web search / audit). Badge: *Satire · not fact-checked*. **Check anyway** runs a full audit | literal risk × 0.2 |
+| **Satire / joke passed off as fact** | e.g. a Babylon Bee headline posted sincerely in r/politics – fully audited and labelled **Satire passed off as news** | full |
+
+Turn off *Treat evident satire & jokes as harmless* to audit and flag everything by its literal truth (posts already skipped on the page are re-checked).
+
+<img src="userscript/docs/panel-tone.png" alt="Satire passed off as news flagged; jokes not fact-checked" width="720">
 
 ### Research log & duplicate detection
 
@@ -52,6 +70,8 @@ Before a post costs anything it is matched against the log, cheapest check first
 
 Safeguards: two texts are never treated as duplicates if their **numbers differ** (“inflation fell to 1 %” ≠ “… 3 %”) or one is **negated** (“does” ≠ “doesn't”), and very short titles only match word-for-word. Identical posts that appear on screen together are checked once (the second waits for the first).
 
+Duplicates must also share the same **tone**: the free tiers require the same framing (plain / `/s` sarcasm / humour / satire subreddit / satire link elsewhere), so “5G spreads the virus /s” never inherits the verdict of the sincere post with the same words, and an Onion link in r/TheOnion is not reused for the same link posted as news in r/politics. Claim-level matches require the same tone class (sincere vs. joke vs. joke-passed-off-as-fact) – even if the model says the claims are the same.
+
 Reused results are labelled **Reused** with a link to the original post and a **Check anyway** button that ignores the match and runs a full check. The History tab can **Forget** individual entries; *Settings → Advanced → Clear research log* wipes it.
 
 <img src="userscript/docs/panel-history.png" alt="History tab" width="720">
@@ -65,7 +85,8 @@ Reused results are labelled **Reused** with a link to the original post and a **
 | Tavily API key | – | Optional. Without it the model's own knowledge is used and it is told to mark unverifiable recent news as *unverified*, not *false*. |
 | **Risk threshold** | **60 %** | Slider 5–100 %. Lower = more sensitive. Changing it re-evaluates existing results instantly (no new API calls). |
 | Open panel automatically | When a risky post is on screen | or *whenever posts are being researched*, or *never* (the launcher tab just shows a red count). |
-| Don't flag satire | on | Posts with `sarcasm_score ≥ 7` are shown as *Likely satire*. |
+| Treat evident satire & jokes as harmless | on | Their risk is discounted 80 % – unless they're passed off as real news. Sarcasm is always decoded. |
+| Don't spend tokens on satire subreddits | on | r/TheOnion, r/BabylonBee, r/\*circlejerk… are skipped without an API call. |
 | Check after on-screen for | 1200 ms | Dwell time before a post is checked. |
 | Parallel checks | 2 | |
 | Daily spend cap | $0.50 | 0 = no cap. Estimated from token usage and the per-token prices under *Advanced*. |

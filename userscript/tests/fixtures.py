@@ -91,7 +91,42 @@ TWINS = [
          fact="Radar studies suggest it but it is unconfirmed.", context="", verdict="Partly supported."),
 ]
 TWINS.append(dict(TWINS[0], id="twinb", sub="science", title=TWINS[0]["title"] + "!"))
-ALL = POSTS + DUPES + TWINS
+
+# Humour / sarcasm / satire, served on /r/tone
+BEE_URL = "https://babylonbee.com/news/congress-votes-to-replace-national-anthem-with-nickelback-song"
+TONE = [
+    # sarcasm debunking a myth: the intended meaning is true -> must not be flagged
+    dict(id="sarc01", sub="vaccines", type="text",
+         title="Oh sure, vaccines totally contain 5G microchips, that's why my wifi got better /s",
+         body="Some people will believe anything.", verifiable=True, ctype="science/health",
+         tone="sarcastic", literal="Vaccines contain 5G microchips.", claim="Vaccines do not contain 5G microchips.",
+         truth=10, sarcasm=8, conf="high", fact="No vaccine contains microchips [1].", context="",
+         verdict="Accurate: the sarcastic post correctly mocks the microchip myth."),
+    # same words as the flagged fake01 plus "/s" -> must NOT inherit fake01's verdict
+    dict(_fake, id="sarc5g", title=_fake["title"] + " /s", tone="sarcastic", literal=_fake["claim"],
+         claim="The WHO has not confirmed that 5G towers spread the virus.", truth=10, sarcasm=8,
+         verdict="Accurate: the post is mocking the 5G myth."),
+    # satire in its own subreddit -> skipped for free
+    dict(id="bee01v", sub="babylonbee", type="link", url=BEE_URL, body="",
+         title="Congress votes to replace the national anthem with a Nickelback song", verifiable=True, ctype="meme/satire",
+         tone="satirical", paf=False, claim="Congress voted to replace the national anthem with a Nickelback song.",
+         truth=0, sarcasm=10, conf="high", fact="Babylon Bee satire.", context="", verdict="Satire."),
+    # the same satire link posted sincerely in r/politics -> satire passed off as news -> flagged, no reuse
+    dict(id="bee01", sub="politics", type="link", url=BEE_URL, body="",
+         title="Congress votes to replace the national anthem with a Nickelback song", verifiable=True, ctype="politics",
+         tone="satirical", paf=True, claim="Congress voted to replace the national anthem with a Nickelback song.",
+         truth=0, sarcasm=9, conf="high", fact="The story comes from the satire site Babylon Bee [1]; no such vote happened.",
+         context="Satire shared as if it were real news.", verdict="False: this is a Babylon Bee satire article, not real news."),
+    # evident joke in a humour sub -> tone-skipped after the extraction call only
+    dict(id="meme01", sub="funny", type="text", flair="Humor", title="Scientists confirm cats are technically a liquid",
+         body="", verifiable=True, ctype="meme/satire", tone="humorous", paf=False,
+         claim="Scientists have confirmed cats are a liquid.", truth=2, sarcasm=9, conf="high", fact="", context="", verdict="Joke."),
+    # joke making the same claim as the sincere fake01 (used with ignoreSatire off -> tone class must block reuse)
+    dict(_fake, id="joke5g", sub="PoliticalHumor", body="", title="WHO: 5G spreads the virus, tinfoil hats now mandatory",
+         tone="humorous", paf=False, same_as_of="fake01", sarcasm=9,
+         verdict="A joke about the 5G conspiracy theory; the literal claim is false."),
+]
+ALL = POSTS + DUPES + TWINS + TONE
 BY_ID = {f"t3_{p['id']}": p for p in ALL}
 
 
@@ -107,7 +142,7 @@ def by_id_json(ids):
             continue
         children.append({"kind": "t3", "data": {
             "name": i, "id": p["id"], "title": p["title"], "selftext": p["body"], "subreddit": p["sub"],
-            "link_flair_text": None, "is_self": p["type"] == "text",
+            "link_flair_text": p.get("flair"), "is_self": p["type"] == "text",
             "url": p.get("url") or f"https://www.reddit.com{permalink(p)}",
             "domain": f"self.{p['sub']}" if p["type"] == "text" else "example.com",
             "permalink": permalink(p), "author": "someone",
@@ -127,6 +162,7 @@ def shreddit_page(posts=None):
   post-type="{p["type"]}" domain="{"self." + p["sub"] if p["type"] == "text" else "example.com"}" author="someone"
   content-href="{e(p.get("url") or "https://www.reddit.com" + permalink(p))}">
   <div class="credit"><span class="sub">r/{p["sub"]}</span> • 3 hr. ago <span class="join">Join</span><span class="dots">···</span></div>
+  {f'<shreddit-post-flair><span>{e(p["flair"])}</span></shreddit-post-flair>' if p.get("flair") else ""}
   <a slot="title" href="{permalink(p)}" class="title">{e(p["title"])}</a>
   {body}{media}
   <div class="actions"><span>▲ 1.2k ▼</span><span>💬 348</span><span>🏆</span><span>↗ Share</span></div>
@@ -172,6 +208,13 @@ ul.flat-list a{{color:#888;font-weight:bold;font-size:x-small}}
 </style></head><body><div id="header"></div><div id="siteTable">{"".join(things)}</div><div style="height:1500px"></div></body></html>'''
 
 
+def _tone(p):
+    return p.get("tone") or ("satirical" if p.get("sarcasm", 0) >= 7 else "sincere")
+
+
+_AUDIT_OVERRIDE = {}
+
+
 def _find(pred):
     for p in ALL:
         if pred(p):
@@ -184,26 +227,33 @@ def llm_reply(body):
     msgs = body.get("messages", [])
     user = msgs[-1]["content"] if msgs else ""
     if "Identify the main factual claim" in user:
-        p = _find(lambda p: f"Title: {p['title']}\n" in user)
+        p = (_find(lambda p: f"Title: {p['title']}\n" in user and f"Subreddit: r/{p['sub']}\n" in user)
+             or _find(lambda p: f"Title: {p['title']}\n" in user))
         if not p:
             return {"is_verifiable": False, "content_type": "other", "summary": "unknown", "claim": "", "query": ""}
         if not p["verifiable"]:
             return {"is_verifiable": False, "content_type": p["ctype"], "summary": "A user asks for hiking suggestions.", "claim": "", "query": ""}
-        out = {"is_verifiable": True, "content_type": p["ctype"], "summary": p["title"], "claim": p["claim"], "query": "verify: " + p["claim"][:60]}
+        out = {"is_verifiable": True, "content_type": p["ctype"], "summary": p["title"], "claim": p["claim"], "query": "verify: " + p["claim"][:60],
+               "tone": _tone(p), "tone_confidence": "high", "presented_as_fact": p.get("paf", False), "literal_claim": p.get("literal", "")}
         if "Previously fact-checked claims" in user:
             out["same_as"] = None
             if p.get("same_as_of"):
                 import re
                 target = next(q for q in ALL if q["id"] == p["same_as_of"])["claim"]
-                for label, text in re.findall(r"\[(C\d+)\] (.*)", user):
+                for label, text in re.findall(r"\[(C\d+)\] \([^)]*\) (.*)", user):
                     if text.strip() == target:
                         out["same_as"] = label
         return out
     if "Audit this claim" in user:
-        p = _find(lambda p: p.get("claim") and f"Claim: {p['claim']}\n" in user)
+        p = (_find(lambda p: p.get("claim") and f"Claim: {p['claim']}\n" in user and f"Title: {p['title']}\n" in user and f"Subreddit: r/{p['sub']}\n" in user)
+             or _find(lambda p: p.get("claim") and f"Claim: {p['claim']}\n" in user and f"Title: {p['title']}\n" in user)
+             or _find(lambda p: p.get("claim") and f"Claim: {p['claim']}\n" in user))
         if not p:
             return {"truth_score": 5, "sarcasm_score": 0, "confidence": "low", "factual_check": "?", "context_check": "", "verdict": "Unknown."}
-        return {"truth_score": p["truth"], "sarcasm_score": p["sarcasm"], "confidence": p["conf"],
+        if p.get("id") in _AUDIT_OVERRIDE:
+            p = _AUDIT_OVERRIDE[p["id"]]
+        return {"truth_score": p["truth"], "satire_score": p["sarcasm"], "confidence": p["conf"], "tone": _tone(p),
+                "presented_as_fact": p.get("paf", False), "tone_reason": f"mock: {_tone(p)}",
                 "factual_check": p["fact"], "context_check": p["context"], "verdict": p["verdict"]}
     return {"ok": True}
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Truth Auditor
 // @namespace    https://github.com/pjvjay/reddit-truth-auditor
-// @version      1.1.0
+// @version      1.2.0
 // @description  Fact-checks the Reddit posts you are looking at (LLM + optional live web research) and slides open a side panel when a post looks false or misleading.
 // @author       pjvjay
 // @match        https://www.reddit.com/*
@@ -45,6 +45,11 @@
  * near-identical text) and, after the cheap claim-extraction step, by claim
  * (lexical + model-judged), so repeats and reposts reuse the earlier verdict.
  *
+ * Tone (humour / sarcasm / satire) is detected from free local signals (satire
+ * sites & subreddits, "/s", flair) and by the model. Sarcasm is decoded so the
+ * author's intended meaning is checked; evident satire is discounted, but satire
+ * passed off as real news is flagged. Duplicates only match within the same tone.
+ *
  * All UI lives in a Shadow DOM so Reddit's CSS cannot break it (and vice versa).
  * DOM is built with createElement/textContent only (no innerHTML), so post
  * titles and model output can never inject markup.
@@ -56,7 +61,7 @@
   if (window.__RTA_LOADED__) return;
   window.__RTA_LOADED__ = true;
 
-  const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.1.0';
+  const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.2.0';
 
   // ---------------------------------------------------------------------------
   // Settings & storage
@@ -70,8 +75,9 @@
     tavilyKey: '',
     riskThreshold: 60,        // 0-100. Panel opens when risk >= this. 60 == truth_score <= 4/10
     autoOpen: 'risky',        // 'risky' | 'always' | 'never'
-    ignoreSatire: true,       // don't flag posts the model thinks are jokes/satire
-    satireCutoff: 7,          // sarcasm_score >= this counts as satire
+    ignoreSatire: true,       // evident satire/jokes are harmless unless passed off as real news
+    skipSatireVenues: true,   // no API call for posts in dedicated satire subreddits
+    satireCutoff: 7,          // satire_score >= this counts as non-literal (legacy records without "tone")
     inlineBadges: true,
     dwellMs: 1200,            // how long a post must be on screen before it is checked
     maxConcurrent: 2,
@@ -180,6 +186,7 @@
     scale: 'M12 3v18M5 21h14M6 7h12M6 7l-3 7a3 3 0 0 0 6 0L6 7ZM18 7l-3 7a3 3 0 0 0 6 0l-3-7Z',
     eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12ZM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z',
     clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM12 7v5l3 2',
+    smile: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18ZM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01',
   };
   function icon(name, size = 16) {
     const s = document.createElementNS(SVG_NS, 'svg');
@@ -259,6 +266,69 @@
     return host + path + (q ? `?${q}` : '');
   }
 
+  // ---------------------------------------------------------------------------
+  // Tone: humour, sarcasm & satire
+  // ---------------------------------------------------------------------------
+  const SATIRE_DOMAINS = ['theonion.com', 'babylonbee.com', 'clickhole.com', 'thebeaverton.com', 'newsthump.com', 'thedailymash.co.uk',
+    'waterfordwhispersnews.com', 'thehardtimes.net', 'reductress.com', 'duffelblog.com', 'der-postillon.com', 'the-postillon.com',
+    'theshovel.com.au', 'chaser.com.au', 'fakingnews.com', 'hard-drive.net', 'thespoof.com', 'newsbiscuit.com', 'thelapine.ca',
+    'thedailybonnet.com', 'sportspickle.com', 'elmundotoday.com', 'legorafi.fr', 'lercio.it', 'worldnewsdailyreport.com', 'thepoke.co.uk'];
+  const SATIRE_SUBS = new Set(['theonion', 'satire', 'babylonbee', 'thebabylonbee', 'thebeaverton', 'clickhole', 'thehardtimes', 'reductress',
+    'newsthump', 'thedailymash', 'subredditsimulator', 'subsimulatorgpt2', 'subsimgpt2interactive', 'totallynotrobots', 'shittyaskscience', 'shittylifeprotips']);
+  const HUMOUR_SUBS = new Set(['funny', 'memes', 'dankmemes', 'me_irl', 'meirl', '2meirl4meirl', 'shitposting', 'comedycemetery', 'comedyheaven',
+    'wholesomememes', 'historymemes', 'prequelmemes', 'programmerhumor', 'sciencememes', 'politicalhumor', 'politicalcompassmemes',
+    'bonehurtingjuice', 'terriblefacebookmemes', 'atetheonion', 'jokes', 'dadjokes', 'antimeme', 'surrealmemes']);
+  const REAL_ABSURD_SUBS = new Set(['nottheonion', 'floridaman', 'offbeat']);
+  const SARC_MARK = /(^|[\s(\[])\/(s|sarcasm|j|jk)\b(?!\/)|\[\s*sarcasm\s*\]/i;
+  const TITLE_LABEL = /[\[(]\s*(satire|satirical|parody|joke|humou?r|shitpost|meme)\s*[\])]/i;
+  const HUMOUR_FLAIR = /satire|humou?r|meme|shitpost|joke|funny|parody|sarcas|circlejerk|comedy|\blol\b|fluff/i;
+
+  // Free, local tone signals. `frame` is the coarse framing used to keep duplicates apart:
+  // literal | sarcasm | humour | satire-venue (satire sub) | satire-link (satire site posted elsewhere).
+  function toneSignals(p) {
+    const sub = String(p.subreddit || '').toLowerCase();
+    const text = `${p.title || ''}\n${String(p.body || '').slice(0, 3000)}`;
+    const u = safeUrl(p.url);
+    const host = u ? hostOf(u) : '';
+    const satireSite = !!host && (SATIRE_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`)) || (host === 'newyorker.com' && /\/humor\//.test(u)));
+    const satireSub = SATIRE_SUBS.has(sub) || /circlejerk/.test(sub);
+    const humourSub = !satireSub && (HUMOUR_SUBS.has(sub) || /memes?$|humou?r$|^shitpost|^okbuddy/.test(sub));
+    const realAbsurd = REAL_ABSURD_SUBS.has(sub);
+    const sarcMark = SARC_MARK.test(text);
+    const labelled = TITLE_LABEL.test(p.title || '') || HUMOUR_FLAIR.test(p.flair || '');
+    const hints = [];
+    if (satireSub) hints.push(`r/${p.subreddit} is a satire/parody subreddit – posts there are not meant literally.`);
+    if (humourSub) hints.push(`r/${p.subreddit} is a humour/meme subreddit.`);
+    if (realAbsurd) hints.push(`r/${p.subreddit} only allows REAL news stories that sound like satire – do not dismiss it as satire.`);
+    if (satireSite) {
+      hints.push(`The linked site ${host} publishes satire.` +
+        (satireSub || humourSub ? '' : ' It was posted in a non-satire subreddit – check whether it is being passed off as real news.'));
+    }
+    if (sarcMark) hints.push('The post contains a sarcasm/joke marker ("/s" or "/j") – the literal words probably mean the opposite.');
+    if (labelled) hints.push(`The post is labelled as humour/satire (${HUMOUR_FLAIR.test(p.flair || '') ? `flair "${p.flair}"` : 'title label'}).`);
+    let frame = 'literal';
+    if (satireSub || (satireSite && humourSub)) frame = 'satire-venue';
+    else if (satireSite) frame = 'satire-link';
+    else if (sarcMark) frame = 'sarcasm';
+    else if (humourSub || labelled) frame = 'humour';
+    return { frame, hints, satireSite, satireSub, humourSub, realAbsurd, sarcMark, labelled, host };
+  }
+
+  const TONES = ['sincere', 'sarcastic', 'humorous', 'satirical', 'unclear'];
+  const asBool = (v) => v === true || v === 'true' || v === 1 || v === 'yes';
+  function toneOf(r) {
+    if (!r) return 'sincere';
+    if (TONES.includes(r.tone)) return r.tone;
+    return (r.sarcasm || 0) >= (Number(settings.satireCutoff) || 7) ? 'satirical' : 'sincere'; // pre-1.2 records
+  }
+  const isNonLiteral = (r) => ['humorous', 'satirical'].includes(toneOf(r));
+  const satireAsFact = (r) => isNonLiteral(r) && !!r.presentedAsFact;
+  const harmlessJoke = (r) => isNonLiteral(r) && !r.presentedAsFact;
+  // Tone class used for claim-level duplicate matching: l = literal (incl. decoded sarcasm),
+  // n = joke/satire not meant as fact, f = joke/satire passed off as fact.
+  const toneClass = (tone, paf) => (['humorous', 'satirical'].includes(tone) ? (paf ? 'f' : 'n') : 'l');
+  const SATIRE_DISCOUNT = 0.2;
+
   const dupThreshold = () => clampNum(settings.dupThreshold, 50, 100, 80) / 100;
 
   // ---------------------------------------------------------------------------
@@ -277,14 +347,17 @@
       const m = new Map();
       if (raw && typeof raw === 'object') {
         for (const [id, a] of Object.entries(raw)) {
-          if (Array.isArray(a)) m.set(id, { t: a[0], kind: a[1], risk: a[2], title: a[3] || '', sub: a[4] || '', tt: a[5] || '', ct: a[6] || '', url: a[7] || '', dup: a[8] || '', sat: a[9] || 0 });
+          if (!Array.isArray(a)) continue;
+          const legacyTc = a[1] === 'a' ? ((a[9] || 0) >= (Number(settings.satireCutoff) || 7) ? 'n' : 'l') : '';
+          m.set(id, { t: a[0], kind: a[1], risk: a[2], title: a[3] || '', sub: a[4] || '', tt: a[5] || '', ct: a[6] || '', url: a[7] || '', dup: a[8] || '', sat: a[9] || 0,
+            fr: a[10] || 'literal', tc: a[11] != null ? a[11] : legacyTc, ts: a[12] || 0 });
         }
       }
       return m;
     },
     encode() {
       const o = {};
-      for (const [id, m] of this.idx) o[id] = [m.t, m.kind, m.risk, m.title, m.sub, m.tt, m.ct, m.url, m.dup, m.sat];
+      for (const [id, m] of this.idx) o[id] = [m.t, m.kind, m.risk, m.title, m.sub, m.tt, m.ct, m.url, m.dup, m.sat, m.fr, m.tc, m.ts];
       return o;
     },
     set(m, key) { // lazily materialised token sets
@@ -346,6 +419,9 @@
         ct: r.claim ? [...tokenize(r.claim)].join(' ') : '',
         url: urlKey(p.url),
         dup: (r.dupOf && r.dupOf.id) || '',
+        fr: toneSignals(p).frame,
+        tc: r.kind === 'audit' ? toneClass(toneOf(r), r.presentedAsFact) : r.toneSkip ? 'n' : '',
+        ts: r.toneSkip ? 1 : 0,
       };
     },
 
@@ -425,16 +501,26 @@
     entries() { return [...this.load().idx.entries()].sort((a, b) => b[1].t - a[1].t); },
 
     // Tier 1 - free: crosspost of / same link as / near-identical text to a logged post.
+    // Candidates must share the post's framing (sarcasm "/s", satire venue, satire link, humour, literal):
+    // "5G spreads the virus /s" must never inherit the verdict of the sincere post with the same words.
+    usable(m, frame) {
+      if ((m.fr || 'literal') !== frame) return false;
+      if (m.ts && !settings.ignoreSatire) return false; // satire that was never audited can't stand in for an audit
+      return true;
+    },
+
     findSimilarPost(post) {
       this.load();
-      if (post.crosspostParent && post.crosspostParent !== post.id && this.idx.has(post.crosspostParent)) {
+      const frame = toneSignals(post).frame;
+      const xp = post.crosspostParent && this.idx.get(post.crosspostParent);
+      if (xp && post.crosspostParent !== post.id && this.usable(xp, frame)) {
         return { id: post.crosspostParent, via: 'crosspost', sim: 1 };
       }
       const thr = dupThreshold();
       const tt = postTokens(post), uk = urlKey(post.url);
       let best = null;
       for (const [id, m] of this.idx) {
-        if (id === post.id) continue;
+        if (id === post.id || !this.usable(m, frame)) continue;
         const sim = similarity(tt, this.set(m, 'tt'));
         let via = null;
         if (uk && m.url === uk && sim >= Math.min(0.5, thr)) via = 'link';
@@ -445,12 +531,12 @@
     },
 
     // Tier 2 - after claim extraction: lexically equivalent claim already audited.
-    findSimilarClaim(claim, selfId) {
+    findSimilarClaim(claim, selfId, tc) {
       const ct = tokenize(claim);
       const thr = dupThreshold();
       let best = null;
       for (const [id, m] of this.load().idx) {
-        if (id === selfId || m.kind !== 'a' || !m.ct) continue;
+        if (id === selfId || m.kind !== 'a' || !m.ct || m.tc !== tc) continue;
         const sim = similarity(ct, this.set(m, 'ct'));
         if (sim >= thr && (!best || sim > best.sim)) best = { id, via: 'claim', sim };
       }
@@ -471,7 +557,13 @@
         if (score >= 0.25) scored.push({ id, score });
       }
       return scored.sort((x, y) => y.score - x.score).slice(0, n)
-        .map(({ id }) => { const r = this.get(id); return r && r.kind === 'audit' && r.claim ? { id, claim: r.claim } : null; })
+        .map(({ id }) => {
+          const r = this.get(id);
+          if (!r || r.kind !== 'audit' || !r.claim) return null;
+          const t = toneOf(r);
+          const toneLabel = t === 'sarcastic' ? 'sincere meaning of a sarcastic post' : isNonLiteral(r) ? `${t}${r.presentedAsFact ? ', passed off as fact' : ', not meant as fact'}` : 'sincere';
+          return { id, claim: r.claim, tc: toneClass(t, r.presentedAsFact), toneLabel };
+        })
         .filter(Boolean);
     },
   };
@@ -493,7 +585,7 @@
   // Lifetime savings counters (shown in the History tab).
   function getStats() {
     const s = GM_getValue(KEYS.stats, null);
-    return Object.assign({ revisits: 0, dupHits: 0, claimHits: 0, savedUsd: 0, savedSearches: 0, fullChecks: 0, fullUsd: 0, extractChecks: 0, extractUsd: 0 }, s && typeof s === 'object' ? s : {});
+    return Object.assign({ revisits: 0, dupHits: 0, toneSkips: 0, claimHits: 0, savedUsd: 0, savedSearches: 0, fullChecks: 0, fullUsd: 0, extractChecks: 0, extractUsd: 0 }, s && typeof s === 'object' ? s : {});
   }
   function addStats(delta) {
     const st = getStats();
@@ -506,6 +598,8 @@
     const avgFull = st.fullChecks ? st.fullUsd / st.fullChecks : 0.0005;
     const avgExtract = st.extractChecks ? st.extractUsd / st.extractChecks : 0.0001;
     if (kind === 'claim') addStats({ claimHits: 1, savedUsd: Math.max(0, avgFull - avgExtract), savedSearches: settings.tavilyKey ? 1 : 0 });
+    else if (kind === 'tone-model') { addStats({ toneSkips: 1, savedUsd: Math.max(0, avgFull - avgExtract), savedSearches: settings.tavilyKey ? 1 : 0 }); return; }
+    else if (kind === 'tone-venue') { addStats({ toneSkips: 1, savedUsd: avgFull, savedSearches: settings.tavilyKey ? 1 : 0 }); return; }
     else addStats({ [kind === 'revisit' ? 'revisits' : 'dupHits']: 1, savedUsd: avgFull, savedSearches: settings.tavilyKey ? 1 : 0 });
     addUsage({ reused: 1 });
   }
@@ -667,7 +761,7 @@
     });
   }
 
-  const slimPost = (p) => ({ title: p.title, subreddit: p.subreddit, permalink: p.permalink, domain: p.domain || '' });
+  const slimPost = (p) => ({ title: p.title, subreddit: p.subreddit, permalink: p.permalink, domain: p.domain || '', url: p.url || '', flair: p.flair || '' });
 
   // ---------------------------------------------------------------------------
   // Network: GM_xmlhttpRequest (bypasses CORS, and the page can't see the key)
@@ -768,30 +862,47 @@
     return `Subreddit: r/${p.subreddit || 'unknown'}\nFlair: ${p.flair || 'None'}\nLinked URL: ${p.url || 'none'}\n<post>\nTitle: ${p.title}\nBody: ${body || '(no body text)'}\n</post>`;
   }
 
-  function buildExtractMessages(p, candidates) {
+  const TONE_GUIDE = `Tone - decide how the post is meant:
+- "sincere": meant literally.
+- "sarcastic": irony - the author means the OPPOSITE of the literal words (e.g. "Oh sure, vaccines totally contain microchips /s").
+- "humorous": a joke, meme or shitpost, not meant as a factual statement.
+- "satirical": satire/parody news written for comedic effect (The Onion / Babylon Bee style).
+- "unclear": cannot tell.
+"presented_as_fact" (only for humorous/satirical): true if the post presents the content as real - e.g. a satire headline posted in a news/politics subreddit without a label, or with sincere commentary; false if the joke/satire is evident or labelled. Use false for sincere and sarcastic posts.`;
+
+  const signalBlock = (sig) => (sig && sig.hints.length
+    ? `\nContext signals detected automatically (helpful but may be wrong):\n${sig.hints.map((x) => `- ${x}`).join('\n')}\n`
+    : '');
+
+  function buildExtractMessages(p, candidates, sig) {
     const prior = candidates && candidates.length
-      ? `\n\nPreviously fact-checked claims:\n${candidates.map((c, i) => `[C${i + 1}] ${truncate(c.claim, 300)}`).join('\n')}\n` +
-        'If - and only if - this post asserts materially the SAME claim as one of them (same subject, same numbers, same direction/meaning; ' +
-        'rewording is fine), set "same_as" to its label (e.g. "C1"). Otherwise set "same_as" to null. When in doubt, use null.'
+      ? `\n\nPreviously fact-checked claims:\n${candidates.map((c, i) => `[C${i + 1}] (${c.toneLabel}) ${truncate(c.claim, 300)}`).join('\n')}\n` +
+        'If - and only if - this post asserts materially the SAME claim as one of them (same subject, same numbers, same direction/meaning ' +
+        'AND the same tone - a joke or satire never matches a sincere claim; rewording is fine), set "same_as" to its label (e.g. "C1"). ' +
+        'Otherwise set "same_as" to null. When in doubt, use null.'
       : '';
     return [
       { role: 'system', content: SYSTEM },
       {
         role: 'user',
-        content: `Identify the main factual claim in this Reddit post so it can be verified.
+        content: `Identify the main factual claim in this Reddit post so it can be verified, and judge its tone.
 "Verifiable" = a concrete assertion about the real world: events, news headlines, statistics, laws/policies, quotes, scientific or medical claims.
-"Not verifiable" = pure opinion, questions, requests for help, personal anecdotes with nothing checkable, memes/art/jokes with no factual assertion.
+"Not verifiable" = pure opinion, questions, requests for help, personal anecdotes with nothing checkable, jokes/memes/art with no factual assertion.
 For link posts the title is usually the headline - treat it as the claim if it asserts something.
+Satirical or humorous headlines that assert something about the real world ARE verifiable (they may be passed off as fact).
 
-${postBlock(p, 1500)}${prior}
+${TONE_GUIDE}
+For SARCASTIC posts, "claim" must be what the author actually means (the de-ironised statement) and "literal_claim" the literal wording.
+
+${postBlock(p, 1500)}${signalBlock(sig)}${prior}
 
 Return ONLY JSON:
-{"is_verifiable": boolean, "content_type": "news|politics|science/health|finance|personal|opinion|meme/satire|question|other", "summary": "one-sentence plain-language summary of the post", "claim": "the single most important checkable claim, stated neutrally (empty if none)", "query": "an optimised web search query to verify the claim"${prior ? ', "same_as": "C1|C2|...|null"' : ''}}`,
+{"is_verifiable": boolean, "content_type": "news|politics|science/health|finance|personal|opinion|meme/satire|question|other", "summary": "one-sentence plain-language summary of the post", "tone": "sincere|sarcastic|humorous|satirical|unclear", "tone_confidence": "low|medium|high", "presented_as_fact": boolean, "claim": "the single most important checkable claim, stated neutrally (the intended meaning for sarcasm; empty if none)", "literal_claim": "literal wording if sarcastic, else empty", "query": "an optimised web search query to verify the claim"${prior ? ', "same_as": "C1|C2|...|null"' : ''}}`,
       },
     ];
   }
 
-  function buildAuditMessages(p, ext, research) {
+  function buildAuditMessages(p, ext, research, sig) {
     const facts = str(settings.referenceFacts);
     let evidence;
     if (research && research.results && research.results.length) {
@@ -802,40 +913,55 @@ Return ONLY JSON:
         'Your training data has a cutoff date: if the claim concerns recent events you cannot verify, do NOT treat it as false - ' +
         'give truth_score 5 and confidence "low". Reserve low scores for claims you are confident are false or misleading.';
     }
+    const tone = TONES.includes(ext.tone) ? ext.tone : 'unclear';
+    const triage = `Tone from triage: ${tone}${['humorous', 'satirical'].includes(tone) ? `, presented as fact: ${asBool(ext.presented_as_fact)}` : ''}.` +
+      (tone === 'sarcastic' && ext.literal_claim ? ` The claim above is the author's INTENDED meaning; the literal (ironic) wording was: "${truncate(str(ext.literal_claim), 300)}".` : '');
     return [
       { role: 'system', content: SYSTEM },
       {
         role: 'user',
         content: `Today's date: ${todayStr()}.
-Audit this claim from a Reddit post for truthfulness and misleading framing.
+Audit this claim from a Reddit post for truthfulness, misleading framing and tone.
 
 Claim: ${ext.claim}
+${triage}
 
 Original post:
 ${postBlock(p, 600)}
-${facts ? `\nReference facts supplied by the user (treat as reliable):\n${facts}\n` : ''}
+${signalBlock(sig)}${facts ? `\nReference facts supplied by the user (treat as reliable):\n${facts}\n` : ''}
 ${evidence}
 
+${TONE_GUIDE}
+Re-judge the tone using everything above - e.g. research showing the story originates from a satire site means it is satirical, and if the post treats it as real news then presented_as_fact is true (satire passed off as news is misinformation).
+
 Scoring guide:
-- truth_score 0-10: 0 = fabricated/false, 3 = misleading or mostly false, 5 = unverifiable or mixed, 7 = mostly accurate, 10 = fully accurate.
-- sarcasm_score 0-10: how likely the post is satire, a joke or obvious hyperbole rather than a sincere claim (check flair and tone).
+- truth_score 0-10 rates the factual accuracy of the claim as stated (for sarcasm: the intended meaning). Do NOT raise it because something is a joke - the tone fields handle that. 0 = fabricated/false, 3 = misleading or mostly false, 5 = unverifiable or mixed, 7 = mostly accurate, 10 = fully accurate.
+- satire_score 0-10: how likely the content is not meant literally (joke, satire, parody, obvious hyperbole).
 - confidence: "low" | "medium" | "high" - how sure you are of truth_score.
 
 Return ONLY JSON:
-{"truth_score": number, "sarcasm_score": number, "confidence": "low|medium|high", "factual_check": "specific facts, numbers, laws or dates that confirm or contradict the claim; cite sources as [n] when used", "context_check": "missing context or misleading framing, if any", "verdict": "one precise sentence final assessment"}`,
+{"truth_score": number, "satire_score": number, "tone": "sincere|sarcastic|humorous|satirical|unclear", "presented_as_fact": boolean, "tone_reason": "one short sentence on why this tone", "confidence": "low|medium|high", "factual_check": "specific facts, numbers, laws or dates that confirm or contradict the claim; cite sources as [n] when used", "context_check": "missing context or misleading framing, if any", "verdict": "one precise sentence final assessment (mention satire/sarcasm when relevant)"}`,
       },
     ];
   }
 
-  function normaliseAudit(a, ext, research, post) {
+  function normaliseAudit(a, ext, research, post, sig) {
     const truth = Math.round(clampNum(a.truth_score, 0, 10, 5) * 10) / 10;
-    const sarcasm = Math.round(clampNum(a.sarcasm_score, 0, 10, 0) * 10) / 10;
+    const sarcasm = Math.round(clampNum(a.satire_score != null ? a.satire_score : a.sarcasm_score, 0, 10, 0) * 10) / 10;
     const conf = str(a.confidence).toLowerCase();
+    const at = str(a.tone).toLowerCase(), et = str(ext.tone).toLowerCase();
+    const tone = TONES.includes(at) ? at : TONES.includes(et) ? et : sarcasm >= (Number(settings.satireCutoff) || 7) ? 'satirical' : 'sincere';
+    const paf = ['humorous', 'satirical'].includes(tone) && (a.presented_as_fact != null ? asBool(a.presented_as_fact) : asBool(ext.presented_as_fact));
     return {
       kind: 'audit',
       truth,
       sarcasm,
       risk: Math.round((10 - truth) * 10),
+      tone,
+      presentedAsFact: paf,
+      toneReason: str(a.tone_reason),
+      toneHints: sig ? sig.hints : [],
+      literalClaim: tone === 'sarcastic' ? str(ext.literal_claim) : '',
       confidence: ['low', 'medium', 'high'].includes(conf) ? conf : 'medium',
       claim: str(ext.claim),
       summary: str(ext.summary),
@@ -853,29 +979,39 @@ Return ONLY JSON:
     };
   }
 
+  // Result for satire/jokes that were not fact-checked because they are evidently not meant as fact.
+  function toneSkipResult(post, tone, reason, summary, hints) {
+    return { kind: 'skip', toneSkip: true, tone, reason, contentType: tone === 'humorous' ? 'joke/meme' : 'satire', summary: summary || '', toneHints: hints || [], at: Date.now(), post: slimPost(post) };
+  }
+
   // ---------------------------------------------------------------------------
   // Risk evaluation
   // ---------------------------------------------------------------------------
-  const isSatire = (r) => r && r.kind === 'audit' && r.sarcasm >= (Number(settings.satireCutoff) || 7);
+  // Risk actually used for alerts: evident satire/jokes are discounted (if enabled); satire passed
+  // off as real news and decoded sarcasm keep their full risk.
+  function effectiveRisk(r) {
+    if (!r || r.kind !== 'audit') return 0;
+    if (settings.ignoreSatire && harmlessJoke(r)) return Math.round(r.risk * SATIRE_DISCOUNT);
+    return r.risk;
+  }
   function isFlagged(job) {
     const r = job && job.result;
     if (!job || job.state !== 'done' || !r || r.kind !== 'audit') return false;
-    if (settings.ignoreSatire && isSatire(r)) return false;
-    return r.risk >= Number(settings.riskThreshold);
+    return effectiveRisk(r) >= Number(settings.riskThreshold);
   }
   function riskBand(r) {
-    if (isSatire(r)) return 'satire';
-    if (r.risk >= 70) return 'bad';
-    if (r.risk >= 40) return 'warn';
-    return 'ok';
+    if (settings.ignoreSatire && harmlessJoke(r)) return 'satire';
+    const x = effectiveRisk(r);
+    return x >= 70 ? 'bad' : x >= 40 ? 'warn' : 'ok';
   }
   function riskLabel(r) {
-    if (isSatire(r)) return 'Likely satire';
-    if (r.risk >= 70) return 'Likely false';
-    if (r.risk >= 50) return 'Misleading?';
-    if (r.risk >= 35) return 'Unverified';
-    return 'Looks accurate';
+    if (harmlessJoke(r)) return toneOf(r) === 'humorous' ? 'Joke' : 'Likely satire';
+    if (satireAsFact(r) && r.risk >= 50) return 'Satire passed off as news';
+    const x = effectiveRisk(r);
+    const base = x >= 70 ? 'Likely false' : x >= 50 ? 'Misleading?' : x >= 35 ? 'Unverified' : 'Looks accurate';
+    return toneOf(r) === 'sarcastic' ? `Sarcasm – ${base.toLowerCase()}` : base;
   }
+  const toneSkipLabel = (r) => (r.tone === 'humorous' ? 'Joke' : 'Satire');
 
   // ---------------------------------------------------------------------------
   // Job queue
@@ -931,6 +1067,16 @@ Return ONLY JSON:
     return r;
   }
 
+  function venueSkip(post) {
+    if (!settings.ignoreSatire || !settings.skipSatireVenues) return null;
+    const sig = toneSignals(post);
+    if (sig.frame !== 'satire-venue') return null;
+    const r = toneSkipResult(post, 'satirical', 'venue', '', sig.hints);
+    Log.put(post.id, r, post);
+    recordSaving('tone-venue');
+    return r;
+  }
+
   function onDwell(el, adapter) {
     if (!el.isConnected) return;
     const dom = adapter.read(el);
@@ -946,8 +1092,13 @@ Return ONLY JSON:
     if (!subAllowed(dom.subreddit)) return;
 
     // Already researched this exact post (any tab, any earlier session)?
-    const logged = Log.get(dom.id);
+    let logged = Log.get(dom.id);
+    if (logged && logged.toneSkip && !settings.ignoreSatire) { Log.remove(dom.id); logged = null; } // user now wants satire audited
     if (logged) { recordSaving('revisit'); showLogged(dom.id, el, dom, logged, !!logged.dupOf); return; }
+
+    // Evident satire venue (r/TheOnion, r/*circlejerk…) - nothing to fact-check, no tokens.
+    const venueR = venueSkip(dom);
+    if (venueR) { showLogged(dom.id, el, dom, venueR, false); return; }
 
     // A repost / near-duplicate of something already researched? (uses on-page text; re-checked with full text later)
     const dupR = reuseDuplicatePost(dom);
@@ -966,9 +1117,9 @@ Return ONLY JSON:
 
   // A near-identical post that is being researched right now (e.g. two crossposts on screen together).
   function findInflightTwin(job) {
-    const tt = postTokens(job.post), uk = urlKey(job.post.url), thr = dupThreshold();
+    const tt = postTokens(job.post), uk = urlKey(job.post.url), thr = dupThreshold(), fr = toneSignals(job.post).frame;
     for (const other of jobs.values()) {
-      if (other === job || other.state !== 'running' || !other.fp) continue;
+      if (other === job || other.state !== 'running' || !other.fp || other.fp.fr !== fr) continue;
       if (job.post.crosspostParent === other.id || other.post.crosspostParent === job.id) return other;
       const sim = similarity(tt, other.fp.tt);
       if (sim >= thr || (uk && uk === other.fp.url && sim >= Math.min(0.5, thr))) return other;
@@ -1008,6 +1159,12 @@ Return ONLY JSON:
       job.post = mergePost(job.post, await Enricher.get(job.id));
       job.post.id = job.id;
       if (!subAllowed(job.post.subreddit)) { removeJob(job); return; }
+      const sig = toneSignals(job.post);
+
+      if (!force) {
+        const venueR = venueSkip(job.post); // full post data may reveal a satire link in a satire sub
+        if (venueR) { updateJob(job, { state: 'skipped', stage: null, result: venueR }); return; }
+      }
 
       if (settings.dedupe && !force) {
         // If an equivalent post is mid-check, wait for it instead of paying twice.
@@ -1021,29 +1178,44 @@ Return ONLY JSON:
         const dupR = reuseDuplicatePost(job.post);
         if (dupR) { updateJob(job, { state: dupR.kind === 'skip' ? 'skipped' : 'done', stage: null, result: dupR, reused: true }); maybeAnnounce(job); return; }
       }
-      job.fp = { tt: postTokens(job.post), url: urlKey(job.post.url) }; // lets later twins find this job
+      job.fp = { tt: postTokens(job.post), url: urlKey(job.post.url), fr: sig.frame }; // lets later twins find this job
 
       // 1. Claim extraction (finalrun.py: extract_prompt) + semantic "already checked?" judgement
       const candidates = settings.dedupe && !force ? Log.claimCandidates(job.post) : [];
-      const ext = await llmJson(buildExtractMessages(job.post, candidates), settings, meter);
+      const ext = await llmJson(buildExtractMessages(job.post, candidates, sig), settings, meter);
       addStats({ extractChecks: 1, extractUsd: meter.usd });
       ext.claim = str(ext.claim);
-      const verifiable = ext.is_verifiable === true || ext.is_verifiable === 'true';
+      ext.tone = TONES.includes(str(ext.tone).toLowerCase()) ? str(ext.tone).toLowerCase() : 'unclear';
+      ext.presented_as_fact = ['humorous', 'satirical'].includes(ext.tone) && asBool(ext.presented_as_fact);
+      const verifiable = asBool(ext.is_verifiable);
       if (!verifiable || !ext.claim) {
-        const r = { kind: 'skip', contentType: str(ext.content_type), summary: str(ext.summary), at: Date.now(), post: slimPost(job.post) };
+        const r = { kind: 'skip', contentType: str(ext.content_type), summary: str(ext.summary), tone: ext.tone, at: Date.now(), post: slimPost(job.post) };
         Log.put(job.id, r, job.post);
         addUsage({ checks: 1 });
         updateJob(job, { state: 'skipped', stage: null, result: r });
         return;
       }
 
-      // Tier 2: same claim already audited (model-judged first, then lexical) -> skip research + audit.
+      // Evident joke/satire that is NOT passed off as fact -> nothing worth researching.
+      if (!force && settings.ignoreSatire && ['humorous', 'satirical'].includes(ext.tone) && !ext.presented_as_fact && str(ext.tone_confidence).toLowerCase() !== 'low') {
+        const r = toneSkipResult(job.post, ext.tone, 'model', str(ext.summary), sig.hints);
+        r.claim = ext.claim;
+        Log.put(job.id, r, job.post);
+        recordSaving('tone-model');
+        addUsage({ checks: 1 });
+        updateJob(job, { state: 'skipped', stage: null, result: r });
+        return;
+      }
+
+      // Tier 2: same claim (and same tone class) already audited -> skip research + audit.
       if (settings.dedupe && !force) {
+        const tc = toneClass(ext.tone, ext.presented_as_fact);
         let match = null;
         const lab = /^C(\d+)$/i.exec(str(ext.same_as));
         const cand = lab && candidates[Number(lab[1]) - 1];
-        if (cand) match = { id: cand.id, via: 'semantic', sim: null };
-        if (!match) match = Log.findSimilarClaim(ext.claim, job.id);
+        if (cand && cand.tc === tc) match = { id: cand.id, via: 'semantic', sim: null };
+        else if (cand) log('rejected same_as: tone class', cand.tc, '!=', tc);
+        if (!match) match = Log.findSimilarClaim(ext.claim, job.id, tc);
         const orig = match && Log.get(match.id);
         if (orig && orig.kind === 'audit') {
           const r = reuseResult(match.id, orig, job.post, match.via, match.sim);
@@ -1067,8 +1239,8 @@ Return ONLY JSON:
 
       // 3. Audit (finalrun.py: audit_prompt)
       updateJob(job, { stage: 'audit' });
-      const audit = await llmJson(buildAuditMessages(job.post, ext, research), settings, meter);
-      const r = normaliseAudit(audit, ext, research, job.post);
+      const audit = await llmJson(buildAuditMessages(job.post, ext, research, sig), settings, meter);
+      const r = normaliseAudit(audit, ext, research, job.post, sig);
       Log.put(job.id, r, job.post);
       addStats({ fullChecks: 1, fullUsd: meter.usd });
       addUsage({ checks: 1 });
@@ -1120,6 +1292,9 @@ Return ONLY JSON:
       Pills.render(job);
     }
     for (const job of jobs.values()) if (job.state === 'blocked') { job.state = 'queued'; queue.push(job); UI.renderJob(job); Pills.render(job); }
+    if (!settings.ignoreSatire && settings.apiKey) {
+      for (const job of [...jobs.values()]) if (job.state === 'skipped' && job.result && job.result.toneSkip) recheck(job, false);
+    }
     UI.updateStatus();
     pump();
   }
@@ -1246,7 +1421,8 @@ li.rta-li{padding:0 !important}
         if (isFlagged(job)) el.setAttribute('data-rta-flagged', '1');
         else el.removeAttribute('data-rta-flagged');
       }
-      const show = settings.inlineBadges && el && el.isConnected && ['queued', 'running', 'done', 'error'].includes(job.state);
+      const toneSkip = job.state === 'skipped' && job.result && job.result.toneSkip;
+      const show = settings.inlineBadges && el && el.isConnected && (['queued', 'running', 'done', 'error'].includes(job.state) || toneSkip);
       let rec = this.map.get(job.id);
       if (rec && (!show || rec.el !== el || !rec.mount.isConnected)) { this.remove(job.id); rec = null; }
       if (!show) return;
@@ -1265,11 +1441,15 @@ li.rta-li{padding:0 !important}
       if (job.state === 'queued') pill.replaceChildren(h('span', { class: 'rta-dot' }), 'Queued for fact-check');
       else if (job.state === 'running') pill.replaceChildren(h('span', { class: 'rta-spin' }), 'Fact-checking…');
       else if (job.state === 'error') pill.replaceChildren(h('span', { class: 'rta-dot' }), 'Check failed');
-      else {
+      else if (toneSkip) {
+        pill.setAttribute('data-band', 'satire');
+        pill.replaceChildren(h('span', { class: 'rta-dot' }), `${toneSkipLabel(job.result)} · not fact-checked`);
+      } else {
         const r = job.result;
         pill.setAttribute('data-band', riskBand(r));
         if (isFlagged(job)) pill.setAttribute('data-flagged', '1');
-        pill.replaceChildren(h('span', { class: 'rta-dot' }), isSatire(r) && !isFlagged(job) ? 'Likely satire' : `${riskLabel(r)} · ${r.risk}% risk`);
+        pill.replaceChildren(h('span', { class: 'rta-dot' }),
+          settings.ignoreSatire && harmlessJoke(r) && !isFlagged(job) ? riskLabel(r) : `${riskLabel(r)} · ${effectiveRisk(r)}% risk`);
       }
     },
 
@@ -1343,7 +1523,7 @@ button{font:inherit;color:inherit}
 .history{display:none}
 .scroll[data-tab=history] .history{display:block}
 .scroll[data-tab=history] .list,.scroll[data-tab=history] .empty{display:none !important}
-.h-stats{margin:0 12px 10px;padding:12px 14px;border-radius:14px;background:linear-gradient(135deg,rgba(124,156,255,.12),rgba(176,132,255,.06));border:1px solid rgba(124,156,255,.25);display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+.h-stats{margin:0 12px 10px;padding:12px 14px;border-radius:14px;background:linear-gradient(135deg,rgba(124,156,255,.12),rgba(176,132,255,.06));border:1px solid rgba(124,156,255,.25);display:grid;grid-template-columns:repeat(2,1fr);gap:10px 8px;text-align:center}
 .h-stats b{display:block;font-size:17px;font-weight:800;color:#fff;letter-spacing:-.01em}
 .h-stats span{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700}
 .h-tools{display:flex;gap:8px;align-items:center;margin:0 12px 10px}
@@ -1430,6 +1610,8 @@ button{font:inherit;color:inherit}
 .gauge.satire{--c:var(--accent2)}
 .skip-ico,.err-ico{width:26px;height:26px;flex:none;border-radius:8px;display:grid;place-items:center;background:rgba(255,255,255,.06);color:var(--muted)}
 .err-ico{background:rgba(255,92,108,.14);color:var(--bad)}
+.skip-ico.sat{background:rgba(176,132,255,.16);color:#d7c2ff}
+.card.skipped.tone{opacity:.85}
 
 details{margin-top:8px;border-top:1px solid var(--line);padding-top:6px}
 summary{cursor:pointer;list-style:none;font-size:11.5px;font-weight:600;color:#aab8ff;display:inline-flex;align-items:center;gap:5px;user-select:none}
@@ -1634,6 +1816,7 @@ input[type=range].neutral{accent-color:var(--accent)}
           h('option', { value: 'all' }, 'All'),
           h('option', { value: 'flagged' }, 'Risky'),
           h('option', { value: 'dup' }, 'Reused'),
+          h('option', { value: 'tone' }, 'Satire / jokes'),
           h('option', { value: 'skip' }, 'No claim'));
         if (this.histUi) { search.value = this.histUi.search.value; filter.value = this.histUi.filter.value; }
         search.addEventListener('input', debounce(() => { this.histLimit = 40; this.renderHistoryList(); }, 200));
@@ -1647,6 +1830,7 @@ input[type=range].neutral{accent-color:var(--accent)}
       this.histUi.stats.replaceChildren(
         stat(Log.size().toLocaleString(), 'posts logged'),
         stat((st.dupHits + st.claimHits + st.revisits).toLocaleString(), 'repeats skipped'),
+        stat((st.toneSkips || 0).toLocaleString(), 'satire / jokes skipped'),
         stat(`$${st.savedUsd.toFixed(st.savedUsd < 1 ? 3 : 2)}`, 'est. saved'));
       this.renderHistoryList();
     },
@@ -1658,7 +1842,8 @@ input[type=range].neutral{accent-color:var(--accent)}
       const thr = Number(settings.riskThreshold);
       const rows = Log.entries().filter(([, m]) => {
         if (q && !`${m.title} r/${m.sub}`.toLowerCase().includes(q)) return false;
-        if (f === 'flagged') return m.kind === 'a' && m.risk >= thr && !(settings.ignoreSatire && m.sat >= (Number(settings.satireCutoff) || 7));
+        if (f === 'flagged') return m.kind === 'a' && (settings.ignoreSatire && m.tc === 'n' ? Math.round(m.risk * SATIRE_DISCOUNT) : m.risk) >= thr;
+        if (f === 'tone') return m.tc === 'n' || m.tc === 'f' || !!m.ts;
         if (f === 'dup') return !!m.dup;
         if (f === 'skip') return m.kind === 's';
         return true;
@@ -1792,7 +1977,7 @@ input[type=range].neutral{accent-color:var(--accent)}
         }
       }
       const keep = ['onscreen', 'pulse', 'focus'].filter((c) => card.classList.contains(c));
-      card.className = ['card', job.state, isFlagged(job) ? 'flagged' : '', ...keep].filter(Boolean).join(' ');
+      card.className = ['card', job.state, isFlagged(job) ? 'flagged' : '', job.result && job.result.toneSkip ? 'tone' : '', ...keep].filter(Boolean).join(' ');
       card.replaceChildren(...this.cardContent(job), h('span', { class: 'onscreen-tag', title: 'This post is on your screen right now' }, icon('eye', 11), 'On screen'));
       this.updateEmpty();
     },
@@ -1883,10 +2068,21 @@ input[type=range].neutral{accent-color:var(--accent)}
             })))];
       }
 
+      if (job.state === 'skipped' && job.result && job.result.toneSkip) {
+        const r = job.result;
+        const why = r.reason === 'venue' ? (r.toneHints && r.toneHints[0]) || 'Posted in a satire subreddit.' : 'Evident satire/joke that is not presented as real news.';
+        return [h('div', { class: 'skip-ico sat' }, icon('smile', 14)),
+          h('div', { class: 'main' }, title,
+            this.metaRow(job, [h('span', { class: 'tag sat' }, toneSkipLabel(r)), 'not fact-checked', job.history ? ago(job.loggedAt) : null]),
+            h('div', { class: 'note' }, `${why} ${r.reason === 'venue' ? 'No tokens were spent.' : 'Web research and audit were skipped.'}`),
+            h('div', { class: 'actions' },
+              job.history ? this.forgetBtn(job) : h('button', { class: 'btn small', type: 'button', title: 'Fact-check the literal claim anyway (uses API credits)', onclick: () => recheck(job, true) }, 'Check anyway')))];
+      }
+
       if (job.state === 'skipped') {
         const r = job.result || {};
         return [h('div', { class: 'skip-ico' }, icon('quote', 14)),
-          h('div', { class: 'main' }, title, this.metaRow(job, [`No checkable claim${r.contentType ? ` (${r.contentType})` : ''}`, job.history ? ago(job.loggedAt) : null]),
+          h('div', { class: 'main' }, title, this.metaRow(job, [`No checkable claim${['humorous', 'satirical', 'sarcastic'].includes(r.tone) ? ` (${r.tone === 'humorous' ? 'joke' : r.tone})` : r.contentType ? ` (${r.contentType})` : ''}`, job.history ? ago(job.loggedAt) : null]),
             job.history ? h('div', { class: 'actions' }, this.forgetBtn(job)) : null)];
       }
 
@@ -1900,9 +2096,11 @@ input[type=range].neutral{accent-color:var(--accent)}
       // done
       const r = job.result;
       const band = riskBand(r);
-      const gaugeB = h('b', {}, String(r.risk), h('small', {}, '%'));
-      const gauge = h('div', { class: `gauge ${band}`, title: `Risk ${r.risk}% (truth score ${r.truth}/10)` }, gaugeB);
-      requestAnimationFrame(() => requestAnimationFrame(() => gauge.style.setProperty('--rta-p', String(r.risk))));
+      const eff = effectiveRisk(r);
+      const gaugeB = h('b', {}, String(eff), h('small', {}, '%'));
+      const gauge = h('div', { class: `gauge ${band}`, title: `Risk ${eff}% (truth score ${r.truth}/10${eff !== r.risk ? `, literal risk ${r.risk}% discounted as evident ${toneOf(r)}` : ''})` }, gaugeB);
+      requestAnimationFrame(() => requestAnimationFrame(() => gauge.style.setProperty('--rta-p', String(eff))));
+      const tone = toneOf(r);
       const flagged = isFlagged(job);
 
       const sources = (r.sources || []).map((s) => {
@@ -1916,10 +2114,14 @@ input[type=range].neutral{accent-color:var(--accent)}
         h('div', { class: 'd-body' },
           h('div', { class: 'scores' },
             h('span', { class: 'chip' }, `Truth ${r.truth}/10`),
-            h('span', { class: 'chip' }, `Satire ${r.sarcasm}/10`),
+            h('span', { class: 'chip' }, `Tone: ${tone}${isNonLiteral(r) ? (r.presentedAsFact ? ', passed off as fact' : ', not meant as fact') : ''}`),
+            h('span', { class: 'chip' }, `Satire score ${r.sarcasm}/10`),
+            eff !== r.risk ? h('span', { class: 'chip' }, `Literal risk ${r.risk}% → ${eff}%`) : null,
             h('span', { class: 'chip' }, `Confidence: ${r.confidence}`),
             h('span', { class: 'chip' }, r.researched ? `${r.sources.length} web sources` : 'Model knowledge only')),
-          sec('Claim checked', r.claim),
+          sec(tone === 'sarcastic' ? 'Intended meaning checked (sarcasm decoded)' : 'Claim checked', r.claim),
+          r.literalClaim ? sec('Literal (ironic) wording', r.literalClaim) : null,
+          (r.toneReason || (r.toneHints && r.toneHints.length)) ? sec('Tone', [r.toneReason, ...(r.toneHints || []).map((x) => `• ${x}`)].filter(Boolean).join('\n')) : null,
           sec('Fact check', r.factualCheck),
           sec('Context', r.contextCheck),
           sources.length ? sec('Sources', h('ol', {}, sources)) : null,
@@ -1931,8 +2133,10 @@ input[type=range].neutral{accent-color:var(--accent)}
         h('div', { class: 'main' },
           title,
           this.metaRow(job, [
-            flagged ? h('span', { class: 'tag flag' }, icon('alert', 11), 'Flagged') : riskLabel(r),
-            isSatire(r) ? h('span', { class: 'tag sat' }, 'Satire?') : null,
+            flagged ? h('span', { class: 'tag flag' }, icon('alert', 11), 'Flagged') : riskLabel(r).replace(/^Sarcasm – (.)/, (_, c) => c.toUpperCase()),
+            tone === 'sarcastic' ? h('span', { class: 'tag sat' }, 'Sarcasm') : null,
+            harmlessJoke(r) && flagged ? h('span', { class: 'tag sat' }, tone === 'humorous' ? 'Joke' : 'Satire') : null,
+            satireAsFact(r) ? h('span', { class: 'tag flag' }, 'Satire as fact') : null,
             r.dupOf ? h('span', { class: 'tag dup' }, 'Reused') : null,
             `${r.confidence} confidence`,
             job.history ? ago(job.loggedAt) : null,
@@ -2072,7 +2276,9 @@ input[type=range].neutral{accent-color:var(--accent)}
         field('Risk threshold', h('div', { class: 'range-wrap' }, h('div', { class: 'range-top' }, rv, rd), f.riskThreshold),
           'Risk = 100 − truth score × 10. The panel slides open for posts at or above this level.'),
         field('Open the panel automatically', f.autoOpen),
-        cb('ignoreSatire', 'Don’t flag posts that look like satire or jokes'),
+        cb('ignoreSatire', 'Treat evident satire & jokes as harmless – unless they are passed off as real news'),
+        cb('skipSatireVenues', 'Don’t spend tokens on posts in satire subreddits (r/TheOnion, r/BabylonBee, *circlejerk…)'),
+        h('div', { class: 'hint', style: { margin: '-4px 0 12px' } }, 'Sarcasm is always decoded – the author’s intended meaning is what gets fact-checked. Satire shared as if it were real news is always flagged.'),
         cb('inlineBadges', 'Show a status badge on each checked post'),
 
         h('div', { class: 'sec' }, 'Scanning & cost'),
@@ -2128,6 +2334,7 @@ input[type=range].neutral{accent-color:var(--accent)}
         riskThreshold: num('riskThreshold', 0, 100),
         autoOpen: f.autoOpen.value,
         ignoreSatire: f.ignoreSatire.checked,
+        skipSatireVenues: f.skipSatireVenues.checked,
         inlineBadges: f.inlineBadges.checked,
         dwellMs: num('dwellMs', 0, 15000),
         maxConcurrent: Math.round(num('maxConcurrent', 1, 4)),
@@ -2161,7 +2368,7 @@ input[type=range].neutral{accent-color:var(--accent)}
   // CSV export (same columns as finalrun.py's final_policy_audit.csv, plus extras)
   // ---------------------------------------------------------------------------
   function exportCsv() {
-    const cols = ['date', 'post_id', 'risk', 'truth_score', 'sarcasm_score', 'confidence', 'subreddit', 'title', 'claim', 'factual_check', 'context_check', 'verdict', 'sources', 'url', 'reused_from', 'reuse_via'];
+    const cols = ['date', 'post_id', 'risk', 'truth_score', 'sarcasm_score', 'confidence', 'subreddit', 'title', 'claim', 'factual_check', 'context_check', 'verdict', 'sources', 'url', 'reused_from', 'reuse_via', 'tone', 'presented_as_fact', 'effective_risk'];
     const cell = (v) => {
       let s = String(v == null ? '' : v);
       if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // avoid spreadsheet formula injection
@@ -2173,7 +2380,8 @@ input[type=range].neutral{accent-color:var(--accent)}
       .map(([id, r]) => {
         const p = r.post || {}, d = r.dupOf || {};
         return [new Date(r.at).toISOString(), id, r.risk, r.truth, r.sarcasm, r.confidence, p.subreddit, p.title, r.claim, r.factualCheck, r.contextCheck, r.verdict,
-          (r.sources || []).map((x) => x.url).join(' '), p.permalink ? `https://www.reddit.com${p.permalink}` : '', d.id || '', d.via || ''].map(cell).join(',');
+          (r.sources || []).map((x) => x.url).join(' '), p.permalink ? `https://www.reddit.com${p.permalink}` : '', d.id || '', d.via || '',
+          toneOf(r), isNonLiteral(r) ? String(!!r.presentedAsFact) : '', effectiveRisk(r)].map(cell).join(',');
       });
     const csv = [cols.join(','), ...rows].join('\r\n');
     const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
@@ -2206,7 +2414,7 @@ input[type=range].neutral{accent-color:var(--accent)}
   }
 
   // Opt-in hook used by the automated tests (never set on real pages).
-  if (window.__RTA_TEST_HOOKS__) window.__RTA_TEST__ = { tokenize, similarity, urlKey, postTokens, Log };
+  if (window.__RTA_TEST_HOOKS__) window.__RTA_TEST__ = { tokenize, similarity, urlKey, postTokens, toneSignals, effectiveRisk, Log };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
   else boot();

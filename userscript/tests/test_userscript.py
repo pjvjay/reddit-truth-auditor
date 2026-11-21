@@ -90,6 +90,8 @@ class Harness:
             body = fx.old_reddit_page()
         elif u.path.startswith("/r/dupes"):
             body = fx.shreddit_page(fx.DUPES)
+        elif u.path.startswith("/r/tone"):
+            body = fx.shreddit_page(fx.TONE)
         elif u.path.startswith("/r/twins"):
             body = fx.shreddit_page(fx.TWINS)
         else:
@@ -241,11 +243,13 @@ def main_flow_flags_risky_posts(browser):
     for pid in ["true03", "onion04", "mixed05"]:
         h.scroll_to(pid)
         h.page.wait_for_timeout(500)
-    for pid in ["true03", "onion04", "mixed05"]:
+    for pid in ["true03", "mixed05"]:
         h.wait_card_state(pid, "done", timeout=15000)
+    h.wait_card_state("onion04", "skipped")
     check(not h.panel_open(), "non-risky posts must not open the panel")
     check("flagged" not in h.card_classes("onion04"), "satire not flagged")
-    check(h.pill_text("onion04") == "Likely satire", f"satire pill {h.pill_text('onion04')}")
+    check(h.pill_text("onion04") == "Satire · not fact-checked", f"satire pill {h.pill_text('onion04')}")
+    check(not h.calls_mentioning("Area man heroically"), "satire-subreddit post cost no tokens")
     check("flagged" not in h.card_classes("mixed05"), "risk 50 < 60 threshold")
     check("Looks accurate" in h.pill_text("true03"), f"true03 pill {h.pill_text('true03')}")
     check(h.page.locator('.card[data-id="t3_promo99"]').count() == 0, "promoted post ignored")
@@ -280,9 +284,11 @@ def main_flow_flags_risky_posts(browser):
     # 'Show post' scrolls Reddit to the post
     h.page.evaluate("window.scrollTo(0, 0)")
     h.card("xss06").locator(".btn", has_text="Show post").click()
-    h.page.wait_for_timeout(1200)
-    top = h.page.evaluate("document.getElementById('t3_xss06').getBoundingClientRect().top")
-    check(0 < top < 900, f"post scrolled into view ({top})")
+    try:
+        h.page.wait_for_function("(() => { const t = document.getElementById('t3_xss06').getBoundingClientRect().top; return t > 0 && t < 900; })()", timeout=5000)
+    except Exception:
+        top = h.page.evaluate("document.getElementById('t3_xss06').getBoundingClientRect().top")
+        check(False, f"post scrolled into view ({top})")
     check(not h.errors, f"page errors: {h.errors}")
     h.close()
 
@@ -294,7 +300,7 @@ def threshold_is_configurable_via_settings(browser):
     for pid in ["fake01", "true03", "onion04", "mixed05"]:
         h.scroll_to(pid)
         h.page.wait_for_timeout(300)
-        h.wait_card_state(pid, "done") if pid != "hike02" else None
+        h.wait_card_state(pid, "skipped" if pid == "onion04" else "done")
     check(h.page.locator(".tab.flag .n").text_content() == "1", "only fake01 flagged at 60")
 
     def set_threshold(v):
@@ -318,10 +324,11 @@ def threshold_is_configurable_via_settings(browser):
     h.page.locator('.btn-icon[aria-label="Settings"]').click()
     h.page.wait_for_selector(".views.settings")
     h.page.locator('input[aria-label="Risk threshold"]').evaluate("(el) => { el.value = 60; el.dispatchEvent(new Event('input')); }")
-    h.page.locator(".check", has_text="satire").locator("input").uncheck()
+    h.page.locator(".check", has_text="harmless").locator("input").uncheck()
     h.shot("06-settings")
     h.page.locator(".btn.primary", has_text="Save").click()
-    h.page.wait_for_timeout(1200)
+    h.wait_card_state("onion04", "done")   # satire that was skipped is now audited
+    h.page.wait_for_timeout(300)
     check("flagged" in h.card_classes("onion04"), "satire flagged when ignoreSatire off")
     check(not h.errors, f"page errors: {h.errors}")
     h.close()
@@ -619,7 +626,7 @@ def duplicates_reuse_earlier_verdicts(browser):
     with h.page.expect_download() as dl:
         h.page.locator('.btn-icon[aria-label="Export CSV"]').click()
     text = Path(dl.value.path()).read_text(encoding="utf-8-sig")
-    check(text.splitlines()[0].endswith("reused_from,reuse_via"), "csv header")
+    check(text.splitlines()[0].endswith("reused_from,reuse_via,tone,presented_as_fact,effective_risk"), "csv header")
     check(any("t3_fake01b" in l and '"t3_fake01"' in l and '"text"' in l for l in text.splitlines()), "dup row in csv")
     check(not h.errors, f"page errors: {h.errors}")
     h.close()
@@ -712,6 +719,150 @@ def index_self_heals_from_records(browser):
     h.wait_card_state("fake01b", "done")
     check((h.result("fake01b").get("dupOf") or {}).get("id") == "t3_fake01", "duplicate matched against a reconciled record")
     check("t3_fake01" in h.page.evaluate("GM_getValue('rta.idx', {})"), "index repaired")
+    h.close()
+
+
+# ----------------------------------------------------------------------------- humour, sarcasm & satire
+@test
+def tone_signal_rules(browser):
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=0)
+    h.goto()
+    r = h.page.evaluate("""() => {
+      const { toneSignals: t, effectiveRisk: e } = window.__RTA_TEST__;
+      const f = (p) => t(Object.assign({ subreddit: 'news', title: '', body: '', url: '', flair: '' }, p)).frame;
+      const audit = (x) => Object.assign({ kind: 'audit', risk: 90, truth: 1, sarcasm: 9 }, x);
+      return {
+        slashS: f({ title: 'Great, another tax hike. Love it /s' }),
+        slashSBody: f({ title: 'Great news', body: 'totally believable /s' }),
+        urlNotSarcasm: f({ title: 'Link', body: 'see https://x.com/s/abc and /sbin' }),
+        onionInPolitics: f({ subreddit: 'politics', url: 'https://www.theonion.com/area-man' }),
+        onionInOnion: f({ subreddit: 'TheOnion', url: 'https://www.theonion.com/area-man' }),
+        onionInFunny: f({ subreddit: 'funny', url: 'https://theonion.com/x' }),
+        borowitz: f({ subreddit: 'politics', url: 'https://www.newyorker.com/humor/borowitz-report/x' }),
+        circlejerk: f({ subreddit: 'soccercirclejerk' }),
+        memeFlair: f({ subreddit: 'canada', flair: 'Meme' }),
+        titleLabel: f({ title: '[Satire] Government bans Mondays' }),
+        notTheOnion: t({ subreddit: 'nottheonion', title: 'Man sues himself', body: '', url: 'https://bbc.com/x', flair: '' }),
+        plain: f({ title: 'Canada raises interest rates' }),
+        riskJoke: e(audit({ tone: 'satirical', presentedAsFact: false })),
+        riskSatireAsFact: e(audit({ tone: 'satirical', presentedAsFact: true })),
+        riskSarcasm: e(audit({ tone: 'sarcastic' })),
+        riskLegacy: e(audit({})),
+      };
+    }""")
+    check(r["slashS"] == r["slashSBody"] == "sarcasm", f"/s marker {r}")
+    check(r["urlNotSarcasm"] == "literal", f"/s inside URLs is not sarcasm {r}")
+    check(r["onionInPolitics"] == "satire-link" and r["borowitz"] == "satire-link", f"satire site outside satire sub {r}")
+    check(r["onionInOnion"] == r["onionInFunny"] == r["circlejerk"] == "satire-venue", f"satire venue {r}")
+    check(r["memeFlair"] == r["titleLabel"] == "humour", f"humour labels {r}")
+    check(r["notTheOnion"]["frame"] == "literal" and any("REAL news" in x for x in r["notTheOnion"]["hints"]), "r/nottheonion is real news")
+    check(r["plain"] == "literal", "plain")
+    check(r["riskJoke"] == 18, f"evident satire discounted {r}")
+    check(r["riskSatireAsFact"] == 90 and r["riskSarcasm"] == 90, f"satire-as-fact / sarcasm keep full risk {r}")
+    check(r["riskLegacy"] == 18, "pre-1.2 records with high sarcasm_score still treated as satire")
+    h.close()
+
+
+@test
+def sarcasm_and_satire_are_understood(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=150), delay=120, ctx=ctx)
+    h.goto()                                  # log the sincere, flagged fake01 first
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(1000)
+    h.goto(path="/r/tone/")
+    for p in fx.TONE[:5]:
+        h.scroll_to(p["id"])
+        h.page.wait_for_timeout(300)
+    for pid, st in [("sarc01", "done"), ("sarc5g", "done"), ("bee01v", "skipped"), ("bee01", "done"), ("meme01", "skipped")]:
+        h.wait_card_state(pid, st)
+    h.page.wait_for_timeout(400)
+
+    # sarcasm decoded: intended meaning is checked, not the literal words -> no false alarm
+    sarc = h.result("sarc01")
+    check(sarc["tone"] == "sarcastic" and sarc["claim"] == "Vaccines do not contain 5G microchips.", f"sarcasm decoded {sarc['claim']}")
+    check("flagged" not in h.card_classes("sarc01"), "sarcastic debunk not flagged")
+    check(h.pill_text("sarc01").startswith("Sarcasm – looks accurate"), h.pill_text("sarc01"))
+    ext = h.calls_mentioning("Title: Oh sure, vaccines")[0]["body"]["messages"][-1]["content"]
+    check('sarcasm/joke marker' in ext and '"sarcastic"' in ext, "/s hint + tone guide sent to the model")
+    audit = [c for c in h.calls_mentioning("Claim: Vaccines do not contain") if "Audit this claim" in c["body"]["messages"][-1]["content"]][0]["body"]["messages"][-1]["content"]
+    check("INTENDED meaning" in audit and "Vaccines contain 5G microchips" in audit, "audit told about the ironic wording")
+
+    # "/s" copy of the flagged post: same words, opposite meaning -> never reused from fake01
+    check(not h.result("sarc5g").get("dupOf"), "sarcastic copy not reused from the sincere post")
+    check(len(h.calls_mentioning("Title: " + fx.TONE[1]["title"])) == 2, "sarcastic copy got its own check")
+    check("flagged" not in h.card_classes("sarc5g"), "sarcastic copy not flagged")
+
+    # satire in its own subreddit: free skip; same link passed off as news elsewhere: flagged
+    check(not h.calls_mentioning("r/babylonbee"), "satire subreddit cost no tokens")
+    check(h.pill_text("bee01v") == "Satire · not fact-checked", h.pill_text("bee01v"))
+    bee = h.result("bee01")
+    check(not bee.get("dupOf"), "satire-as-news not reused from the satire-venue copy")
+    check(bee["tone"] == "satirical" and bee["presentedAsFact"] is True, "satire passed off as fact detected")
+    check("flagged" in h.card_classes("bee01"), "satire passed off as news is flagged")
+    check(h.pill_text("bee01").startswith("Satire passed off as news"), h.pill_text("bee01"))
+    bee_ext = h.calls_mentioning("Title: Congress votes")[0]["body"]["messages"][-1]["content"]
+    check("babylonbee.com publishes satire" in bee_ext and "non-satire subreddit" in bee_ext, "satire-site hint sent")
+
+    # evident joke in a humour subreddit: only the extraction call, no research/audit
+    check(len(h.calls_mentioning("Title: Scientists confirm cats")) == 1, "joke tone-skipped after extraction")
+    check(h.pill_text("meme01") == "Joke · not fact-checked", h.pill_text("meme01"))
+    check(not any("cats" in c["body"]["query"] for c in h.calls["tavily"]), "no web search for the joke")
+    h.card("bee01").scroll_into_view_if_needed()
+    h.card("bee01").locator("summary").click()
+    h.shot("14-tone-satire-sarcasm")
+
+    # History: satire/jokes filter + counter
+    h.page.locator(".tab.hist").click()
+    h.page.locator(".h-tools select").select_option("tone")
+    h.page.wait_for_timeout(300)
+    titles = h.page.locator(".history .card:visible .t").all_text_contents()
+    check(len(titles) == 4 and sum("Nickelback" in t for t in titles) == 2 and any("cats" in t for t in titles)
+          and not any("vaccines" in t for t in titles), f"satire/jokes filter (incl. satire-as-news, excl. sarcasm) {titles}")
+    check("satire / jokes skipped" in h.page.locator(".h-stats").text_content(), "tone skip counter")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def jokes_never_reuse_sincere_verdicts(browser):
+    # With "treat satire as harmless" OFF, jokes are audited; the joke makes the same claim as the
+    # sincere fake01 and the model even says same_as - but the tone class differs, so no reuse.
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=150, ignoreSatire=False), delay=100, ctx=ctx)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(1000)
+    h.goto(path="/r/tone/")
+    h.scroll_to("joke5g")
+    h.wait_card_state("joke5g", "done")
+    h.page.wait_for_timeout(300)
+    r = h.result("joke5g")
+    ext = h.calls_mentioning("Title: WHO: 5G spreads")[0]["body"]["messages"][-1]["content"]
+    check("[C1] (sincere)" in ext, "candidates carry their tone")
+    check(not r.get("dupOf"), "joke not reused from sincere claim despite same_as")
+    check(r["tone"] == "humorous" and "flagged" in h.card_classes("joke5g"), "audited at full literal risk when satire isn't ignored")
+    # and the satire subreddit is audited too (no free skip when satire isn't ignored)
+    h.scroll_to("bee01v")
+    h.wait_card_state("bee01v", "done")
+    check(h.calls_mentioning("r/babylonbee"), "satire venue audited when ignoreSatire is off")
+    h.close()
+
+
+@test
+def check_anyway_audits_skipped_satire(browser):
+    h = Harness(browser, settings=dict(BASE, dwellMs=150), delay=100)
+    h.goto(path="/r/tone/")
+    h.scroll_to("bee01v")
+    h.wait_card_state("bee01v", "skipped")
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.card("bee01v").locator(".btn", has_text="Check anyway").click()
+    h.wait_card_state("bee01v", "done")
+    r = h.result("bee01v")
+    check(r["kind"] == "audit" and r["tone"] == "satirical" and r["presentedAsFact"] is False, "audited as satire")
+    check("flagged" not in h.card_classes("bee01v"), "evident satire stays below the threshold (discounted)")
+    check(h.page.evaluate("window.__RTA_TEST__.effectiveRisk(window.__RTA_TEST__.Log.get('t3_bee01v'))") == 20, "100% literal risk -> 20%")
     h.close()
 
 
