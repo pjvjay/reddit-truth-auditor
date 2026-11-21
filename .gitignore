@@ -17,3 +17,6 @@ logs/
 
 *.csv
 
+
+# userscript test output
+userscript/tests/screenshots/

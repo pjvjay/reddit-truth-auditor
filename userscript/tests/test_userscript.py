@@ -1,0 +1,516 @@
+"""
+End-to-end tests for reddit-truth-auditor.user.js.
+
+Runs the real userscript in headless Chromium against mock Reddit pages, with
+Tampermonkey's GM_* API shimmed and OpenAI / Tavily / reddit.com intercepted.
+No network access or API keys needed.
+
+    pip install playwright && playwright install chromium
+    python userscript/tests/test_userscript.py            # screenshots -> userscript/tests/screenshots/
+"""
+import json
+import os
+import sys
+import time
+import traceback
+from pathlib import Path
+from urllib.parse import urlparse
+
+from playwright.sync_api import sync_playwright
+
+sys.path.insert(0, str(Path(__file__).parent))
+import fixtures as fx  # noqa: E402
+
+HERE = Path(__file__).parent
+SCRIPT = (HERE.parent / "reddit-truth-auditor.user.js").read_text(encoding="utf-8")
+SHOTS = Path(os.environ.get("RTA_SHOTS", HERE / "screenshots"))
+SHOTS.mkdir(parents=True, exist_ok=True)
+
+GM_SHIM = r"""
+(() => {
+  const KEY = '__gm_store__';
+  const store = JSON.parse(localStorage.getItem(KEY) || 'null') || (window.__GM_INIT || {});
+  const persist = () => localStorage.setItem(KEY, JSON.stringify(store));
+  persist();
+  const clone = (v) => v === undefined ? v : JSON.parse(JSON.stringify(v));
+  window.GM_getValue = (k, d) => (k in store ? clone(store[k]) : d);
+  window.GM_setValue = (k, v) => { store[k] = clone(v); persist(); };
+  window.GM_deleteValue = (k) => { delete store[k]; persist(); };
+  window.GM_info = { script: { version: '1.0.0-test' } };
+  window.GM_registerMenuCommand = () => {};
+  window.GM_addStyle = (css) => { const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s; };
+  window.GM_xmlhttpRequest = (o) => {
+    const delay = window.__MOCK_DELAY ?? 500;
+    setTimeout(() => {
+      fetch(o.url, { method: o.method, headers: o.headers, body: o.data })
+        .then(async (r) => o.onload({ status: r.status, responseText: await r.text() }))
+        .catch((e) => o.onerror && o.onerror(e));
+    }, delay);
+  };
+})();
+"""
+
+CORS = {"access-control-allow-origin": "*", "access-control-allow-headers": "*", "access-control-allow-methods": "*"}
+
+
+class Harness:
+    def __init__(self, browser, settings=None, delay=500, width=1440, height=900, page_kind="shreddit",
+                 openai_status=200, ctx=None, by_id_status=200):
+        self.calls = {"openai": [], "tavily": [], "by_id": []}
+        self.by_id_status = by_id_status
+        self.openai_status = openai_status
+        self.ctx = ctx or browser.new_context(viewport={"width": width, "height": height}, accept_downloads=True)
+        self.page = self.ctx.new_page()
+        self.page.on("pageerror", lambda e: self.errors.append(str(e)))
+        self.page.on("console", lambda m: m.type == "error" and self.errors.append("console: " + m.text))
+        self.errors = []
+        init = {"rta.settings": settings} if settings is not None else {}
+        self.page.add_init_script(f"window.__GM_INIT = {json.dumps(init)}; window.__MOCK_DELAY = {delay};")
+        self.page.add_init_script(GM_SHIM)
+        self.page.add_init_script(SCRIPT)
+        self.page.route("https://www.reddit.com/**", self._reddit)
+        self.page.route("https://old.reddit.com/**", self._reddit)
+        self.page.route("https://api.openai.com/**", self._openai)
+        self.page.route("https://api.tavily.com/**", self._tavily)
+        self.page_kind = page_kind
+
+    def _reddit(self, route):
+        u = urlparse(route.request.url)
+        if "/by_id/" in u.path:
+            ids = u.path.split("/by_id/")[1].replace(".json", "").split(",")
+            self.calls["by_id"].append(ids)
+            if self.by_id_status != 200:
+                return route.fulfill(status=self.by_id_status, body="Too Many Requests")
+            return route.fulfill(status=200, content_type="application/json", body=fx.by_id_json(ids))
+        body = fx.old_reddit_page() if u.netloc.startswith("old.") else fx.shreddit_page()
+        route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
+
+    def _openai(self, route):
+        if route.request.method == "OPTIONS":
+            return route.fulfill(status=204, headers=CORS)
+        body = json.loads(route.request.post_data or "{}")
+        self.calls["openai"].append({"headers": route.request.headers, "body": body})
+        if self.openai_status != 200:
+            return route.fulfill(status=self.openai_status, headers=CORS, content_type="application/json",
+                                 body=json.dumps({"error": {"message": "Incorrect API key provided: sk-bad."}}))
+        content = fx.llm_reply(body)
+        resp = {"choices": [{"message": {"content": json.dumps(content)}}], "usage": {"prompt_tokens": 900, "completion_tokens": 150}}
+        route.fulfill(status=200, headers=CORS, content_type="application/json", body=json.dumps(resp))
+
+    def _tavily(self, route):
+        if route.request.method == "OPTIONS":
+            return route.fulfill(status=204, headers=CORS)
+        body = json.loads(route.request.post_data or "{}")
+        self.calls["tavily"].append({"headers": route.request.headers, "body": body})
+        route.fulfill(status=200, headers=CORS, content_type="application/json", body=json.dumps(fx.tavily_reply(body)))
+
+    def goto(self, old=False):
+        self.page.goto("https://old.reddit.com/" if old else "https://www.reddit.com/")
+        self.page.wait_for_selector("#reddit-truth-auditor", state="attached")
+
+    # --- helpers -------------------------------------------------------------
+    def panel_open(self):
+        return self.page.locator(".panel.open").count() == 1
+
+    def card(self, pid):
+        return self.page.locator(f'.card[data-id="t3_{pid}"]')
+
+    def card_classes(self, pid):
+        return self.card(pid).get_attribute("class") or ""
+
+    def wait_card_state(self, pid, state, timeout=15000):
+        self.page.wait_for_selector(f'.card.{state}[data-id="t3_{pid}"]', state="attached", timeout=timeout)
+
+    def pill_text(self, pid):
+        return self.page.evaluate(f"""(() => {{
+            const el = document.getElementById('t3_{pid}') || document.querySelector('[data-fullname="t3_{pid}"]');
+            if (!el) return null;
+            const next = el.nextElementSibling;
+            const pill = (next && next.classList.contains('rta-slot') ? next : el).querySelector('.rta-pill');
+            return pill ? pill.textContent : null; }})()""")
+
+    def scroll_to(self, pid):
+        self.page.evaluate(f"(document.getElementById('t3_{pid}') || document.querySelector('[data-fullname=\"t3_{pid}\"]')).scrollIntoView({{block:'center'}})")
+
+    def shot(self, name):
+        self.page.wait_for_timeout(700)  # let the slide animation settle
+        self.page.screenshot(path=str(SHOTS / f"{name}.png"))
+
+    def close(self):
+        self.ctx.close()
+
+
+BASE = {"apiKey": "sk-test-1234", "tavilyKey": "tvly-test-9876", "dwellMs": 300, "riskThreshold": 60, "autoOpen": "risky"}
+
+results = []
+
+
+def test(fn):
+    results.append(fn)
+    return fn
+
+
+def check(cond, msg):
+    if not cond:
+        raise AssertionError(msg)
+
+
+# -----------------------------------------------------------------------------
+@test
+def first_run_opens_settings(browser):
+    h = Harness(browser, settings=None)
+    h.goto()
+    h.page.wait_for_selector(".panel.open", timeout=5000)
+    h.page.wait_for_selector(".views.settings", timeout=5000)
+    check("needs-setup" in h.page.locator(".launcher").get_attribute("class"), "launcher should show setup dot")
+    h.page.wait_for_timeout(2000)
+    check(len(h.calls["openai"]) == 0, "no API calls without a key")
+    check(h.page.locator(".card").count() == 0, "no jobs without key")
+    h.shot("01-first-run-settings")
+    # enter key through the UI -> posts already on screen get checked without scrolling
+    h.page.locator('input[type="password"]').first.fill("sk-from-ui-0001")
+    h.page.locator(".btn.primary", has_text="Save").click()
+    h.page.wait_for_selector('.card[data-id="t3_fake01"]', timeout=8000)
+    stored = h.page.evaluate("GM_getValue('rta.settings', {})")
+    check(stored["apiKey"] == "sk-from-ui-0001", "key saved")
+    check(h.page.locator('input[type="password"]').first.input_value() == "", "key must never be rendered back into the DOM")
+    h.page.wait_for_function("() => true")
+    h.page.wait_for_timeout(2500)
+    check(h.calls["openai"][0]["headers"]["authorization"] == "Bearer sk-from-ui-0001", "auth header uses saved key")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def main_flow_flags_risky_posts(browser):
+    h = Harness(browser, settings=BASE, delay=600)
+    h.goto()
+    check(not h.panel_open(), "panel starts closed")
+    # fake01 and hike02 are visible at load
+    h.wait_card_state("fake01", "running", timeout=6000)
+    check(not h.panel_open(), "panel must stay closed while researching in 'risky' mode")
+    check("Fact-checking" in (h.pill_text("fake01") or ""), f"pill shows spinner text: {h.pill_text('fake01')}")
+    check("busy" in h.page.locator(".launcher").get_attribute("class"), "launcher ring spins while busy")
+    h.page.screenshot(path=str(SHOTS / "02-researching-pills.png"))
+
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_selector(".panel.open", timeout=3000)
+    check("flagged" in h.card_classes("fake01"), "fake01 flagged")
+    check("Likely false" in h.pill_text("fake01") and "90% risk" in h.pill_text("fake01"), f"pill: {h.pill_text('fake01')}")
+    check(h.page.evaluate("document.getElementById('t3_fake01').getAttribute('data-rta-flagged')") == "1", "post element marked")
+    h.wait_card_state("hike02", "skipped")
+    check(h.pill_text("hike02") is None, "no badge on non-claim posts")
+    # panel width = 25% of viewport
+    w = h.page.evaluate("document.querySelector('#reddit-truth-auditor').shadowRoot.querySelector('.panel').getBoundingClientRect().width")
+    check(abs(w - 1440 * 0.25) < 1, f"panel width {w} should be 25% of 1440")
+    # details + sources (javascript: URL from search results must be dropped)
+    h.card("fake01").locator("summary").click()
+    links = h.card("fake01").locator(".d-sec a").evaluate_all("els => els.map(e => e.href)")
+    check(links == ["https://www.reuters.com/fact-check/example", "https://www.who.int/news"], f"sources {links}")
+    h.shot("03-flagged-panel-open")
+
+    # request shape
+    oa = h.calls["openai"][0]
+    check(oa["headers"]["authorization"] == "Bearer sk-test-1234", "openai auth")
+    check(oa["body"]["model"] == "gpt-4o-mini" and oa["body"]["response_format"] == {"type": "json_object"}, "openai body")
+    check(h.calls["tavily"] and h.calls["tavily"][0]["headers"]["authorization"] == "Bearer tvly-test-9876", "tavily auth")
+    check(any("t3_fake01" in b for b in h.calls["by_id"]), "post text fetched via /by_id")
+    audit_prompt = [c for c in h.calls["openai"] if "Audit this claim" in c["body"]["messages"][-1]["content"]][0]["body"]["messages"][-1]["content"]
+    check("<research>" in audit_prompt and "reuters.com" in audit_prompt, "research evidence passed to audit")
+
+    # close, scroll on: satire + true + mixed should NOT reopen the panel
+    h.page.locator('.btn-icon[aria-label="Close panel"]').click()
+    h.page.wait_for_timeout(800)
+    for pid in ["true03", "onion04", "mixed05"]:
+        h.scroll_to(pid)
+        h.page.wait_for_timeout(500)
+    for pid in ["true03", "onion04", "mixed05"]:
+        h.wait_card_state(pid, "done", timeout=15000)
+    check(not h.panel_open(), "non-risky posts must not open the panel")
+    check("flagged" not in h.card_classes("onion04"), "satire not flagged")
+    check(h.pill_text("onion04") == "Likely satire", f"satire pill {h.pill_text('onion04')}")
+    check("flagged" not in h.card_classes("mixed05"), "risk 50 < 60 threshold")
+    check("Looks accurate" in h.pill_text("true03"), f"true03 pill {h.pill_text('true03')}")
+    check(h.page.locator('.card[data-id="t3_promo99"]').count() == 0, "promoted post ignored")
+    h.page.locator(".launcher").click()
+    h.page.wait_for_selector(".panel.open")
+    h.shot("04-live-feed-mixed-results")
+
+    # xss post -> flagged -> reopens the panel; nothing executes
+    h.page.locator('.btn-icon[aria-label="Close panel"]').click()
+    h.page.wait_for_timeout(700)
+    h.scroll_to("xss06")
+    h.wait_card_state("xss06", "done")
+    h.page.wait_for_selector(".panel.open", timeout=3000)
+    h.card("xss06").locator("summary").click()
+    h.page.wait_for_timeout(300)
+    check(h.page.evaluate("!window.__xss && !window.__xss2 && !window.__xss3"), "no script execution from titles / model output")
+    check("<img" in h.card("xss06").locator(".t").text_content(), "title rendered as text")
+    check(h.page.locator(".card img").count() == 0, "no injected elements in cards")
+    check(h.page.locator(".tab.flag .n").text_content() == "2", "flagged count 2")
+    h.page.locator(".tab.flag").click()
+    h.shot("05-flagged-tab")
+    visible = h.page.locator(".card:visible").count()
+    check(visible == 2, f"flagged tab shows only flagged cards ({visible})")
+
+    # footer cost tracking: each llm call 900 in + 150 out tokens at gpt-4o-mini prices
+    n = len(h.calls["openai"])
+    usage = h.page.evaluate("GM_getValue('rta.usage')")
+    expected = n * (900 * 0.15 + 150 * 0.60) / 1e6
+    check(abs(usage["usd"] - expected) < 1e-9, f"usage {usage} vs {expected}")
+    check(usage["searches"] == len(h.calls["tavily"]), "search count")
+
+    # 'Show post' scrolls Reddit to the post
+    h.page.evaluate("window.scrollTo(0, 0)")
+    h.card("xss06").locator(".btn", has_text="Show post").click()
+    h.page.wait_for_timeout(1200)
+    top = h.page.evaluate("document.getElementById('t3_xss06').getBoundingClientRect().top")
+    check(0 < top < 900, f"post scrolled into view ({top})")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def threshold_is_configurable_via_settings(browser):
+    h = Harness(browser, settings=dict(BASE, dwellMs=100), delay=100)
+    h.goto()
+    for pid in ["fake01", "true03", "onion04", "mixed05"]:
+        h.scroll_to(pid)
+        h.page.wait_for_timeout(300)
+        h.wait_card_state(pid, "done") if pid != "hike02" else None
+    check(h.page.locator(".tab.flag .n").text_content() == "1", "only fake01 flagged at 60")
+
+    def set_threshold(v):
+        h.page.locator(".launcher").click() if not h.panel_open() else None
+        h.page.locator('.btn-icon[aria-label="Settings"]').click()
+        h.page.wait_for_selector(".views.settings")
+        h.page.locator('input[type="range"]').evaluate(f"(el) => {{ el.value = {v}; el.dispatchEvent(new Event('input')); }}")
+        h.page.locator(".btn.primary", has_text="Save").click()
+        h.page.wait_for_timeout(1200)
+
+    set_threshold(50)
+    check(h.page.evaluate("GM_getValue('rta.settings').riskThreshold") == 50, "threshold saved")
+    check("flagged" in h.card_classes("mixed05"), "mixed05 (risk 50) flagged at threshold 50")
+    check(h.page.locator(".tab.flag .n").text_content() == "2", "2 flagged at 50")
+    calls_before = len(h.calls["openai"])
+    set_threshold(95)
+    check("flagged" not in h.card_classes("fake01"), "fake01 (risk 90) not flagged at 95")
+    check(h.page.locator(".tab.flag .n").text_content() == "0", "0 flagged at 95")
+    check(len(h.calls["openai"]) == calls_before, "re-evaluating the threshold must not call the API again")
+    # satire toggle off -> onion (risk 90) flagged at threshold 60
+    h.page.locator('.btn-icon[aria-label="Settings"]').click()
+    h.page.wait_for_selector(".views.settings")
+    h.page.locator('input[type="range"]').evaluate("(el) => { el.value = 60; el.dispatchEvent(new Event('input')); }")
+    h.page.locator(".check", has_text="satire").locator("input").uncheck()
+    h.shot("06-settings")
+    h.page.locator(".btn.primary", has_text="Save").click()
+    h.page.wait_for_timeout(1200)
+    check("flagged" in h.card_classes("onion04"), "satire flagged when ignoreSatire off")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def cache_survives_reload_and_reflags(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=BASE, delay=100, ctx=ctx)
+
+    def fake01_calls():
+        return sum(1 for c in h.calls["openai"] if "5G towers" in c["body"]["messages"][-1]["content"])
+
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(1000)  # debounce-save of the cache
+    check(fake01_calls() == 2, "extract + audit on first view")
+    h.page.reload()
+    h.page.wait_for_selector("#reddit-truth-auditor", state="attached")
+    h.wait_card_state("fake01", "done", timeout=5000)
+    h.page.wait_for_selector(".panel.open", timeout=3000)
+    check(fake01_calls() == 2, "cached result reused after reload, no new API calls")
+    check("from cache" in h.card("fake01").locator(".d-sec").last.text_content(), "marked as cached")
+    # Re-check forces a new analysis
+    h.card("fake01").locator(".btn", has_text="Re-check").click()
+    h.wait_card_state("fake01", "done", timeout=8000)
+    h.page.wait_for_timeout(300)
+    check(fake01_calls() == 4, f"re-check ran extract + audit again ({fake01_calls()})")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def always_mode_shows_spinners(browser):
+    h = Harness(browser, settings=dict(BASE, autoOpen="always"), delay=2500)
+    h.goto()
+    h.page.wait_for_selector(".panel.open", timeout=5000)
+    h.page.wait_for_selector(".card.running .spin", timeout=5000)
+    h.page.wait_for_timeout(2900)  # into the research stage
+    h.page.screenshot(path=str(SHOTS / "07-always-mode-spinners.png"))
+    check(h.page.locator(".card.running .step.active").count() >= 1, "active step shown")
+    h.close()
+
+
+@test
+def never_mode_nudges_launcher_only(browser):
+    h = Harness(browser, settings=dict(BASE, autoOpen="never"), delay=100)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(500)
+    check(not h.panel_open(), "never mode keeps the panel closed")
+    check(h.page.locator(".launcher .count.show").text_content() == "1", "launcher badge count")
+    h.shot("08-never-mode-launcher")
+    h.close()
+
+
+@test
+def budget_cap_blocks_new_checks(browser):
+    h = Harness(browser, settings=dict(BASE, dailyBudgetUsd=0.0001, maxConcurrent=1), delay=100)
+    h.goto()
+    h.page.wait_for_timeout(3000)
+    for pid in ["true03", "onion04"]:
+        h.scroll_to(pid)
+        h.page.wait_for_timeout(600)
+    h.page.wait_for_timeout(1000)
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.page.wait_for_selector(".banner.warn", timeout=3000)
+    check("spending cap" in h.page.locator(".banner.warn").first.text_content(), "budget banner")
+    check(h.page.locator(".card.blocked").count() >= 1, "later posts blocked")
+    usage = h.page.evaluate("GM_getValue('rta.usage')")
+    check(usage["usd"] < 0.0001 + 0.0005, "spend stays near cap")
+    h.close()
+
+
+@test
+def invalid_key_halts_and_explains(browser):
+    h = Harness(browser, settings=BASE, delay=100, openai_status=401)
+    h.goto()
+    h.page.wait_for_selector(".panel.open", timeout=6000)
+    h.page.wait_for_selector(".banner.bad", timeout=3000)
+    check("Incorrect API key" in h.page.locator(".banner.bad").text_content(), "401 message shown")
+    n = len(h.calls["openai"])
+    h.scroll_to("true03")
+    h.page.wait_for_timeout(1500)
+    check(len(h.calls["openai"]) == n, "no further calls once halted")
+    h.shot("09-invalid-key")
+    h.close()
+
+
+@test
+def pause_and_subreddit_filters(browser):
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=100)
+    h.goto()
+    h.page.wait_for_timeout(1500)
+    check(len(h.calls["openai"]) == 0 and h.page.locator(".card").count() == 0, "paused: nothing checked")
+    h.page.locator(".launcher").click()
+    h.page.locator('.btn-icon[aria-label="Resume scanning"]').click()
+    h.wait_card_state("fake01", "done", timeout=6000)  # resumes on-screen posts without scrolling
+    h.close()
+
+    h = Harness(browser, settings=dict(BASE, subsBlock="worldnews, r/hiking"), delay=100)
+    h.goto()
+    h.page.wait_for_timeout(1500)
+    check(h.page.locator('.card[data-id="t3_fake01"]').count() == 0, "blocked sub skipped")
+    check(h.page.locator('.card[data-id="t3_hike02"]').count() == 0, "r/ prefix in block list works")
+    h.close()
+
+    h = Harness(browser, settings=dict(BASE, subsAllow="canada"), delay=100)
+    h.goto()
+    h.scroll_to("true03")
+    h.wait_card_state("true03", "done")
+    check(h.page.locator(".card").count() == 1, "allow-list only")
+    h.close()
+
+
+@test
+def old_reddit_supported(browser):
+    h = Harness(browser, settings=BASE, delay=200)
+    h.goto(old=True)
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_selector(".panel.open", timeout=3000)
+    pill = h.page.locator('[data-fullname="t3_fake01"] ul.flat-list li.rta-li .rta-pill')
+    check(pill.count() == 1 and "Likely false" in pill.text_content(), "old reddit inline badge")
+    h.shot("10-old-reddit")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def csv_export(browser):
+    h = Harness(browser, settings=BASE, delay=100)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(800)
+    with h.page.expect_download() as dl:
+        h.page.locator('.btn-icon[aria-label="Export CSV"]').click()
+    text = Path(dl.value.path()).read_text(encoding="utf-8-sig")
+    lines = text.splitlines()
+    check(lines[0].startswith("date,post_id,risk,truth_score"), "csv header")
+    check(any("t3_fake01" in l and '"90"' in l for l in lines), "fake01 row")
+    h.close()
+
+
+@test
+def narrow_screen_min_width(browser):
+    h = Harness(browser, settings=BASE, delay=100, width=1024, height=768)
+    h.goto()
+    h.page.wait_for_selector(".panel.open", timeout=6000)
+    w = h.page.evaluate("document.querySelector('#reddit-truth-auditor').shadowRoot.querySelector('.panel').getBoundingClientRect().width")
+    check(abs(w - 340) < 0.5, f"panel keeps a readable min width on small screens ({w})")
+    h.close()
+
+
+@test
+def works_without_reddit_json_and_without_tavily(browser):
+    h = Harness(browser, settings=dict(BASE, tavilyKey=""), delay=100, by_id_status=429)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    check(h.calls["by_id"], "tried /by_id")
+    check(not h.calls["tavily"], "no tavily without key")
+    extract = h.calls["openai"][0]["body"]["messages"][-1]["content"]
+    check("Share this before it gets deleted" in extract, "falls back to on-page post text")
+    audit = [c for c in h.calls["openai"] if "Audit this claim" in c["body"]["messages"][-1]["content"]][0]["body"]["messages"][-1]["content"]
+    check("No web research is available" in audit and "do NOT treat it as false" in audit, "knowledge-cutoff guard in prompt")
+    check("Model knowledge only" in h.card("fake01").text_content(), "card says not web-verified")
+    check(h.page.locator(".banner.info", has_text="Tavily").count() == 1, "tavily hint banner")
+    h.close()
+
+
+@test
+def keyboard_shortcuts(browser):
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=100)
+    h.goto()
+    h.page.wait_for_timeout(300)
+    h.page.keyboard.press("Alt+Shift+R")
+    h.page.wait_for_selector(".panel.open")
+    h.page.locator('.btn-icon[aria-label="Settings"]').focus()
+    h.page.keyboard.press("Escape")
+    h.page.wait_for_timeout(300)
+    check(not h.panel_open(), "Esc closes")
+    h.page.keyboard.press("Alt+Shift+R")
+    h.page.wait_for_selector(".panel.open")
+    h.close()
+
+
+def main():
+    only = sys.argv[1:]
+    failed = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        for fn in results:
+            if only and fn.__name__ not in only:
+                continue
+            t = time.time()
+            try:
+                fn(browser)
+                print(f"PASS  {fn.__name__}  ({time.time() - t:.1f}s)")
+            except Exception:
+                failed += 1
+                print(f"FAIL  {fn.__name__}")
+                traceback.print_exc()
+        browser.close()
+    print(f"\n{len(results) - failed if not only else '?'} passed, {failed} failed. Screenshots in {SHOTS}")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
