@@ -173,14 +173,29 @@ class ResearchLog {
 
   flush() { if (this.dirty) this.saveIndex(); }
 
-  /** Merge with what other tabs wrote meanwhile (newest entry wins; same entry -> most advanced publish state), then persist. */
-  saveIndex() {
+  /** Take over what other tabs wrote meanwhile (newest entry wins; same entry -> most advanced publish state). */
+  mergeStored() {
     for (const [id, m] of this.decode(storage.get(KEYS.index, {}))) {
       if (this.deleted.has(id)) continue;
       const cur = this.idx.get(id);
       if (!cur || cur.t < m.t) this.idx.set(id, m);
       else if (cur.t === m.t && m.ps > cur.ps) cur.ps = m.ps;
     }
+  }
+
+  /**
+   * Catch up with other tabs without writing anything. The publisher calls this
+   * before it chooses what to send, so a report another tab has already sent is
+   * not sent again from this tab's older copy of the index.
+   */
+  refresh() {
+    this.load();
+    this.mergeStored();
+  }
+
+  /** Merge with what other tabs wrote meanwhile, then persist. */
+  saveIndex() {
+    this.mergeStored();
     this.deleted.clear();
     this.dirty = false;
     storage.set(KEYS.index, this.encode());

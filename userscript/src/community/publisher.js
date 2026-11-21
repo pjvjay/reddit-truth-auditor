@@ -15,9 +15,14 @@
  *                          which is then marked REJECTED (never retried)
  *   over the daily quota -> keep pending, pause until the server's quota resets
  *                          (the server says so per report, inside a 2xx response)
- * A best-effort cross-tab lock stops two tabs sending the same batch.
+ *
+ * Two tabs: a lock (publish-lock.js) keeps them from publishing at the same
+ * time - reliably between tabs on the same Reddit host where the browser has
+ * Web Locks, best effort otherwise - and each tab catches up with what the
+ * others have sent before it chooses what to send. A duplicate that still gets
+ * through is stored once by the server and is not counted against the quota.
  */
-import { storage } from '../core/env.js';
+import { storage, webLocks } from '../core/env.js';
 import { settings, KEYS } from '../core/settings.js';
 import { emit, on } from '../core/events.js';
 import { log } from '../core/logger.js';
@@ -31,14 +36,13 @@ import { researchLog, PUBLISH } from '../store/research-log.js';
 import { api } from './api.js';
 import { knowledge } from './knowledge.js';
 import { communityConfigured, clientId, communityStatus, setCommunityStatus } from './config.js';
+import { createPublishLock, LOCKED } from './publish-lock.js';
 
 export const BATCH_SIZE = 50;
 const MAX_ROUNDS = 20;
 const LOCK_KEY = 'rta.community.publishLock';
-const LOCK_MS = 60e3;
 const QUOTA_SLACK_MS = 60e3; //          wait this long past the reset, so clocks need not agree exactly
 const QUOTA_MAX_HOLD_MS = 25 * 3600e3; // a daily quota resets within a day, whatever a server claims
-const TAB = Math.random().toString(36).slice(2);
 const SUBREDDIT_RE = /^[A-Za-z0-9_]{2,21}$/;
 
 let busy = false;
@@ -46,6 +50,7 @@ let fails = 0;
 let nextTry = 0;
 let timer = null;
 let started = false;
+const lock = createPublishLock({ storage, locks: webLocks, key: LOCK_KEY });
 
 /** Worth reporting: a canonical claim judged false - or any claim already on the community list (a vote). Never jokes. */
 export function isReportable(r) {
@@ -121,19 +126,6 @@ export function discardQueued() {
   emit('community:changed');
 }
 
-// ---------------------------------------------------------------- cross-tab lock
-function acquireLock() {
-  const l = storage.get(LOCK_KEY, null);
-  if (l && l.owner !== TAB && l.until > Date.now()) return false;
-  storage.set(LOCK_KEY, { owner: TAB, until: Date.now() + LOCK_MS });
-  const c = storage.get(LOCK_KEY, null);
-  return !!c && c.owner === TAB;
-}
-function releaseLock() {
-  const l = storage.get(LOCK_KEY, null);
-  if (l && l.owner === TAB) storage.remove(LOCK_KEY);
-}
-
 // ---------------------------------------------------------------- sending
 function backoff(e) {
   fails++;
@@ -201,6 +193,7 @@ async function drainLegacyOutbox() {
  * 'disabled' | 'auth' | 'busy' | 'backoff' | 'quota' | 'locked' | 'idle' | 'sent' | 'offline'.
  * 'quota': the server's daily quota is used up - what it accepted is marked sent,
  * the rest stays queued and is sent after the quota resets (`force` tries at once).
+ * 'locked': another tab is publishing right now.
  */
 export async function flush({ force = false } = {}) {
   if (!communityConfigured() || !settings.shareReports) return 'disabled';
@@ -209,14 +202,26 @@ export async function flush({ force = false } = {}) {
   if (!force && Date.now() < nextTry) return 'backoff';
   if (!queuedCount()) return 'idle';
   if (!force && quotaHeldUntil()) return 'quota';
-  if (!acquireLock()) return 'locked';
-  busy = true;
+  busy = true; // before the first await, so two calls in this tab cannot both get past here
+  try {
+    const result = await lock.run(publishQueued);
+    if (result !== LOCKED) log('publisher:', result, 'queued', queuedCount());
+    return result;
+  } finally {
+    busy = false;
+  }
+}
+
+/** The body of flush(); runs only while this tab holds the publish lock. */
+async function publishQueued() {
   let result = 'idle';
   try {
+    researchLog.refresh(); // another tab may have sent some of these since this tab last looked
     const drained = await drainLegacyOutbox();
     if (!drained) result = 'quota';
     let size = BATCH_SIZE;
     for (let round = 0; drained && round < MAX_ROUNDS; round++) {
+      if (round && !lock.renew()) break; // a long run outlived its lease and another tab took over
       const batch = eligible(size);
       if (!batch.length) break;
       const built = [], gone = [];
@@ -265,11 +270,8 @@ export async function flush({ force = false } = {}) {
   } catch (e) {
     if (e.transient) { backoff(e); result = 'offline'; } else if (e.auth) { setCommunityStatus({ authError: true }); result = 'auth'; } else throw e;
   } finally {
-    busy = false;
-    releaseLock();
     emit('community:changed');
   }
-  log('publisher:', result, 'queued', queuedCount());
   return result;
 }
 

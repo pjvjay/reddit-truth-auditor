@@ -158,6 +158,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         Returns `accepted`, `keys`, `quota` (`limit`, `used`, `remaining`, `resets_at` in epoch seconds) and `rejected`:
         one `{index, code, reason}` per report that was not stored, where `index` is its position in the request and
         `code` is `quota` (over the daily quota - send it again after `quota.resets_at`), `invalid` or `joke`.
+        `duplicates` is how many of the accepted reports this client had already sent; those cost no quota.
         """
         ok, positions, skipped = [], [], []
         for i, r in enumerate(batch.reports):

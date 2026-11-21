@@ -257,3 +257,58 @@ test('another tab holding the publish lock -> this tab waits', async () => {
   store.set('rta.community.publishLock', { owner: 'other-tab', until: Date.now() - 1 }); // expired
   assert.equal(await flush(), 'sent');
 });
+
+/** Replace navigator.locks for one test (Node 20 has no navigator; newer versions have a real one). */
+function useLockManager(t, locks) {
+  const before = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value: { locks, onLine: true }, configurable: true, writable: true });
+  t.after(() => { if (before) Object.defineProperty(globalThis, 'navigator', before); else delete globalThis.navigator; });
+}
+
+test('another tab on the same host is publishing (Web Lock held) -> this tab sends nothing and waits', async (t) => {
+  let heldElsewhere = true;
+  useLockManager(t, { request: async (_name, _options, callback) => callback(heldElsewhere ? null : {}) });
+  await analysed();
+  respond(accept);
+  assert.equal(await flush(), 'locked');
+  assert.equal(requests.length, 0);
+  assert.equal(store.has('rta.community.publishLock'), false, 'did not touch the lease either');
+  heldElsewhere = false;
+  assert.equal(await flush(), 'sent');
+  assert.equal(requests.length, 1);
+});
+
+test('two flushes started together in one tab send the queue once', async () => {
+  await analysed();
+  await analysed();
+  respond(accept);
+  assert.deepEqual((await Promise.all([flush(), flush()])).sort(), ['busy', 'sent']);
+  assert.equal(requests.length, 1);
+});
+
+test('a report another tab has already sent is not sent again from this tab\'s older copy of the index', async () => {
+  const a = await analysed();
+  const b = await analysed();
+  researchLog.saveIndex();
+  // another tab publishes `a`: it updates the shared index and the record (publish state is the last index field)
+  const idx = store.get(KEYS.index);
+  idx[a][idx[a].length - 1] = PUBLISH.SENT;
+  store.set(KEYS.index, idx);
+  store.set(`${KEYS.logPrefix}${a}`, { ...store.get(`${KEYS.logPrefix}${a}`), ps: PUBLISH.SENT });
+  assert.equal(researchLog.idx.get(a).ps, PUBLISH.PENDING, 'this tab has not noticed yet');
+
+  respond(accept);
+  assert.equal(await flush(), 'sent');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.reports.length, 1, 'only the one that is still waiting');
+  assert.deepEqual(states([a, b]), [PUBLISH.SENT, PUBLISH.SENT]);
+
+  // and when the other tab has sent everything, this tab sends nothing at all
+  const c = await analysed();
+  researchLog.saveIndex();
+  const idx2 = store.get(KEYS.index);
+  idx2[c][idx2[c].length - 1] = PUBLISH.SENT;
+  store.set(KEYS.index, idx2);
+  assert.equal(await flush(), 'idle');
+  assert.equal(requests.length, 1);
+});

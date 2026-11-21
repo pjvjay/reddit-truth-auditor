@@ -122,40 +122,47 @@ class Store:
         self.db.executemany("INSERT OR IGNORE INTO prop_tokens(token, key) VALUES (?,?)", [(t, key) for t in canon.tokens])
         return key
 
-    def _quota(self, client: str, day: str, n: int) -> int:
+    def _used(self, client: str, day: str) -> int:
         row = self.db.execute("SELECT n FROM client_days WHERE client=? AND day=?", (client, day)).fetchone()
-        used = row["n"] if row else 0
-        allowed = max(0, min(n, self.max_per_day - used))
-        if allowed:
-            self.db.execute("INSERT INTO client_days(client, day, n) VALUES (?,?,?) ON CONFLICT(client, day) DO UPDATE SET n = n + ?",
-                            (client, day, allowed, allowed))
-        return allowed
+        return row["n"] if row else 0
 
     def quota(self, client: str, day: str | None = None) -> dict:
         """Where a client stands against its daily quota (the day is the server's UTC day)."""
         day = day or today()
-        row = self.db.execute("SELECT n FROM client_days WHERE client=? AND day=?", (client, day)).fetchone()
-        used = row["n"] if row else 0
+        used = self._used(client, day)
         return {"limit": self.max_per_day, "used": used, "remaining": max(0, self.max_per_day - used), "resets_at": quota_reset(day)}
+
+    def _seen(self, client: str, canon, post: str) -> bool:
+        """Has this client already reported this proposition for this post?"""
+        return self.db.execute("SELECT 1 FROM sightings WHERE key=? AND post=? AND client=?",
+                               (self.resolve(canon.key), post, client)).fetchone() is not None
 
     def ingest(self, client: str, reports: list[dict]) -> dict:
         """
         Store a batch. Each rejection carries a machine-readable `code`:
           "quota"    over the client's daily quota - nothing is wrong with the report; send it again after `quota.resets_at`
           "invalid"  the report itself cannot be used - sending it again will not help
+
+        The quota counts new reports that are stored. A repeat - the same client reporting the same proposition
+        for the same post again, as happens when two of its tabs send the same queue or a reply gets lost - is
+        accepted (the vote and post statistics are refreshed, the sighting stays single), counted in
+        `duplicates`, and costs nothing, even when the quota is used up.
         """
-        accepted, rejected, keys = 0, [], []
+        accepted, duplicates, rejected, keys = 0, 0, [], []
         server_day = today()
         with self.lock, self.db:
-            allowed = self._quota(client, server_day, len(reports))
+            used, new = self._used(client, server_day), 0
             for i, r in enumerate(reports):
-                if i >= allowed:
-                    rejected.append({"index": i, "code": "quota", "reason": "daily quota exceeded"})
-                    continue
                 canon = canonicalize(r["claim"])
                 if canon is None:
                     rejected.append({"index": i, "code": "invalid", "reason": "claim has no subject/object"})
                     continue
+                repeat = self._seen(client, canon, r["post"])
+                if not repeat:
+                    if used + new >= self.max_per_day:
+                        rejected.append({"index": i, "code": "quota", "reason": "daily quota exceeded"})
+                        continue
+                    new += 1
                 # the day the post was SEEN: clients publish offline backlogs later, so accept up to
                 # max_report_age_days back - but never a day in the future or older than that
                 day = r.get("day") or server_day
@@ -187,11 +194,15 @@ class Store:
                 if r.get("url_hash") and stance == "affirms" and prop_truth <= FALSE_MAX:
                     self.db.execute("INSERT OR IGNORE INTO link_reports(key, url_hash, client) VALUES (?,?,?)", (key, r["url_hash"], client))
                 accepted += 1
+                duplicates += repeat
                 keys.append(key)
+            if new:
+                self.db.execute("INSERT INTO client_days(client, day, n) VALUES (?,?,?) ON CONFLICT(client, day) DO UPDATE SET n = n + ?",
+                                (client, server_day, new, new))
             quota = self.quota(client, server_day)
         if accepted:
             self._dirty = True
-        return {"accepted": accepted, "rejected": rejected, "keys": keys, "quota": quota}
+        return {"accepted": accepted, "duplicates": duplicates, "rejected": rejected, "keys": keys, "quota": quota}
 
     def _upsert_post(self, r: dict, day: str, server_day: str) -> None:
         src, att, eng = r.get("source") or {}, r.get("attributed") or {}, r.get("engagement") or {}

@@ -105,6 +105,13 @@
     if (typeof g.GM_registerMenuCommand === "function") g.GM_registerMenuCommand(label2, fn);
   }
   var scriptVersion = () => typeof g.GM_info !== "undefined" && g.GM_info.script && g.GM_info.script.version || (true ? "2.0.0" : "dev");
+  function webLocks() {
+    try {
+      return typeof navigator !== "undefined" && navigator.locks && typeof navigator.locks.request === "function" ? navigator.locks : null;
+    } catch (_) {
+      return null;
+    }
+  }
   var browserOnline = () => typeof navigator === "undefined" ? true : navigator.onLine !== false;
 
   // userscript/src/core/events.js
@@ -655,14 +662,27 @@ ${String(p.body || "").slice(0, 3e3)}`;
     flush() {
       if (this.dirty) this.saveIndex();
     }
-    /** Merge with what other tabs wrote meanwhile (newest entry wins; same entry -> most advanced publish state), then persist. */
-    saveIndex() {
+    /** Take over what other tabs wrote meanwhile (newest entry wins; same entry -> most advanced publish state). */
+    mergeStored() {
       for (const [id, m] of this.decode(storage.get(KEYS.index, {}))) {
         if (this.deleted.has(id)) continue;
         const cur = this.idx.get(id);
         if (!cur || cur.t < m.t) this.idx.set(id, m);
         else if (cur.t === m.t && m.ps > cur.ps) cur.ps = m.ps;
       }
+    }
+    /**
+     * Catch up with other tabs without writing anything. The publisher calls this
+     * before it chooses what to send, so a report another tab has already sent is
+     * not sent again from this tab's older copy of the index.
+     */
+    refresh() {
+      this.load();
+      this.mergeStored();
+    }
+    /** Merge with what other tabs wrote meanwhile, then persist. */
+    saveIndex() {
+      this.mergeStored();
       this.deleted.clear();
       this.dirty = false;
       storage.set(KEYS.index, this.encode());
@@ -1193,20 +1213,63 @@ ${String(p.body || "").slice(0, 3e3)}`;
     return { domain: host, kind };
   }
 
+  // userscript/src/community/publish-lock.js
+  var LOCKED = "locked";
+  var WEB_LOCK = "rta.community.publish";
+  function createPublishLock({ storage: storage2, locks, key, tab = Math.random().toString(36).slice(2), leaseMs = 6e4 }) {
+    function takeLease() {
+      const held = storage2.get(key, null);
+      if (held && held.owner !== tab && held.until > Date.now()) return false;
+      storage2.set(key, { owner: tab, until: Date.now() + leaseMs });
+      const now = storage2.get(key, null);
+      return !!now && now.owner === tab;
+    }
+    function dropLease() {
+      const held = storage2.get(key, null);
+      if (held && held.owner === tab) storage2.remove(key);
+    }
+    async function withLease(fn) {
+      if (!takeLease()) return LOCKED;
+      try {
+        return await fn();
+      } finally {
+        dropLease();
+      }
+    }
+    return {
+      /** Run fn while holding the lock. Resolves to LOCKED, without running fn, if another tab holds it. */
+      async run(fn) {
+        const manager = locks();
+        if (!manager) return withLease(fn);
+        let answered = false;
+        try {
+          return await manager.request(WEB_LOCK, { ifAvailable: true }, (lock2) => {
+            answered = true;
+            return lock2 ? withLease(fn) : LOCKED;
+          });
+        } catch (e) {
+          if (answered) throw e;
+          return withLease(fn);
+        }
+      },
+      /** Extend the lease during a long run. False if another tab has taken it over meanwhile. */
+      renew: takeLease
+    };
+  }
+
   // userscript/src/community/publisher.js
   var BATCH_SIZE = 50;
   var MAX_ROUNDS = 20;
   var LOCK_KEY = "rta.community.publishLock";
-  var LOCK_MS = 6e4;
   var QUOTA_SLACK_MS = 6e4;
   var QUOTA_MAX_HOLD_MS = 25 * 36e5;
-  var TAB = Math.random().toString(36).slice(2);
   var SUBREDDIT_RE = /^[A-Za-z0-9_]{2,21}$/;
   var busy = false;
   var fails = 0;
   var nextTry = 0;
   var timer = null;
   var started = false;
+  var lock = createPublishLock({ storage, locks: webLocks, key: LOCK_KEY });
   function isReportable(r) {
     if (!r || r.kind !== "audit" || !r.canon || !r.canon.fields || harmlessJoke(r)) return false;
     return propositionTruth(r) <= 4 || knowledge.has(r.canon.key);
@@ -1270,17 +1333,6 @@ ${String(p.body || "").slice(0, 3e3)}`;
     storage.remove(KEYS.legacyOutbox);
     emit("community:changed");
   }
-  function acquireLock() {
-    const l = storage.get(LOCK_KEY, null);
-    if (l && l.owner !== TAB && l.until > Date.now()) return false;
-    storage.set(LOCK_KEY, { owner: TAB, until: Date.now() + LOCK_MS });
-    const c = storage.get(LOCK_KEY, null);
-    return !!c && c.owner === TAB;
-  }
-  function releaseLock() {
-    const l = storage.get(LOCK_KEY, null);
-    if (l && l.owner === TAB) storage.remove(LOCK_KEY);
-  }
   function backoff(e) {
     fails++;
     nextTry = Date.now() + Math.min(36e5, 3e4 * 2 ** Math.min(fails - 1, 7));
@@ -1333,14 +1385,24 @@ ${String(p.body || "").slice(0, 3e3)}`;
     if (!force && Date.now() < nextTry) return "backoff";
     if (!queuedCount()) return "idle";
     if (!force && quotaHeldUntil()) return "quota";
-    if (!acquireLock()) return "locked";
     busy = true;
+    try {
+      const result = await lock.run(publishQueued);
+      if (result !== LOCKED) log("publisher:", result, "queued", queuedCount());
+      return result;
+    } finally {
+      busy = false;
+    }
+  }
+  async function publishQueued() {
     let result = "idle";
     try {
+      researchLog.refresh();
       const drained = await drainLegacyOutbox();
       if (!drained) result = "quota";
       let size = BATCH_SIZE;
       for (let round = 0; drained && round < MAX_ROUNDS; round++) {
+        if (round && !lock.renew()) break;
         const batch = eligible(size);
         if (!batch.length) break;
         const built = [], gone = [];
@@ -1401,11 +1463,8 @@ ${String(p.body || "").slice(0, 3e3)}`;
         result = "auth";
       } else throw e;
     } finally {
-      busy = false;
-      releaseLock();
       emit("community:changed");
     }
-    log("publisher:", result, "queued", queuedCount());
     return result;
   }
   function resetBackoff() {

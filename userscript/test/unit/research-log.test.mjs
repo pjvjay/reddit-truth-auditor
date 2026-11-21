@@ -43,6 +43,20 @@ test('index merge keeps the most advanced publish state from another tab', () =>
   assert.equal(researchLog.pendingCount(), 0);
 });
 
+test('refresh() takes over other tabs\' publish states and new entries without writing', () => {
+  researchLog.put('t3_a', audit('Claim one here'), post('t3_a', 'Claim one here'), { publishable: true });
+  researchLog.saveIndex();
+  const idx = store.get(KEYS.index);
+  idx.t3_a[idx.t3_a.length - 1] = PUBLISH.SENT; //                      another tab sent it ...
+  idx.t3_b = [...idx.t3_a]; //                                          ... and analysed a post of its own
+  idx.t3_b[idx.t3_b.length - 1] = PUBLISH.PENDING;
+  store.set(KEYS.index, idx);
+  const stored = JSON.stringify(store.get(KEYS.index));
+  researchLog.refresh();
+  assert.deepEqual(researchLog.pending().map(([id]) => id), ['t3_b']);
+  assert.equal(JSON.stringify(store.get(KEYS.index)), stored, 'read only');
+});
+
 test('reconciles records whose index entry was lost', () => {
   store.set(`${KEYS.logPrefix}t3_z`, { t: Date.now(), r: audit('Orphaned record claim'), ps: PUBLISH.PENDING });
   researchLog.idx = null;

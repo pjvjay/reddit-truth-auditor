@@ -97,6 +97,7 @@ The response says what happened to each report:
 ```json
 {
   "accepted": 5,
+  "duplicates": 0,                     // how many of the accepted ones this client had sent before
   "keys": ["p1_…", "…"],              // proposition keys of the accepted reports, in order
   "rejected": [                        // one entry per report that was not stored
     {"index": 5, "code": "quota", "reason": "daily quota exceeded"}
@@ -114,6 +115,8 @@ The response says what happened to each report:
 | `joke` | Humour or satire not presented as fact. | Marks it rejected; it is not sent again. |
 
 A batch that is partly over the quota is still a `200`: the reports that fit are stored and the rest come back as `quota`.
+
+**Repeats are free.** The quota counts new reports that are stored. A report the server already has from the same client for the same proposition and post (two tabs sent the same queue, or a reply was lost and the client sent again) is accepted, counted in `duplicates` and not charged, even when the quota is used up. It refreshes that client's vote and the post's statistics; the sighting stays single. Reports rejected as `invalid` or `joke` are not charged either.
 
 Storage model:
 - **Votes:** one per (proposition, client), with the latest winning.
@@ -245,7 +248,7 @@ Caveats:
 
 - **Quorum:** the feed needs *N* independent client ids (default 3) **and** ≥ 66 % weighted agreement. Link hashes need the same quorum.
 - **One vote per client per proposition**, and community-derived results never vote.
-- **Quotas:** `RTA_MAX_REPORTS_PER_DAY` per client id (default 2000, counted per UTC day), and `RTA_IP_RATE_PER_MIN` per IP (default 120). Reports over the daily quota are rejected with code `quota` and can be sent again the next day (see §2).
+- **Quotas:** `RTA_MAX_REPORTS_PER_DAY` per client id (default 2000 new reports, counted per UTC day), and `RTA_IP_RATE_PER_MIN` per IP (default 120). Reports over the daily quota are rejected with code `quota` and can be sent again the next day (see §2). Repeats of a report the client has already made cost no quota; they change nothing but that client's own vote and are still bound by the per-IP limit.
 - **Optional publishing tokens** (`RTA_PUBLISH_TOKENS`): hand tokens to trusted users or communities. Reading the feed stays public.
 - Strict validation on every field (lengths, enums, hex hashes, subreddit pattern, host pattern). Invalid batches get `422`. The dashboard escapes all content.
 - Engagement is capped per field and only enters weights through logarithms, so inflated numbers have limited effect. A cluster's weight also needs several independent reporters (consensus factor).

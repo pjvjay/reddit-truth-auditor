@@ -54,5 +54,12 @@ export function registerMenuCommand(label, fn) {
 export const scriptVersion = () =>
   (typeof g.GM_info !== 'undefined' && g.GM_info.script && g.GM_info.script.version) || (typeof __VERSION__ !== 'undefined' ? __VERSION__ : 'dev');
 
+/** The browser's Web Locks manager (shared by tabs on the same host), or null where it is not available. */
+export function webLocks() {
+  try {
+    return typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function' ? navigator.locks : null;
+  } catch (_) { return null; }
+}
+
 /** Whether the browser believes it is online (best effort; false negatives are possible). */
 export const browserOnline = () => (typeof navigator === 'undefined' ? true : navigator.onLine !== false);

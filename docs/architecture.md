@@ -44,6 +44,7 @@
 | | `api.js` | HTTP client that records connectivity. |
 | | `knowledge.js` | Cached feed of agreed mistruths and narratives, plus on-device matching. |
 | | `publisher.js` | **Offline-first publishing** of pending reports. |
+| | `publish-lock.js` | One tab publishes at a time: Web Locks, then a storage lease. |
 | `insights/` | `clustering.js` | JS port of the server's event clustering. |
 | | `local-narratives.js` | Local narratives built from the research log. |
 | | `outlets.js` | Lookups in `spec/outlets.json`. |
@@ -78,7 +79,7 @@ Cheapest check first; every outcome is stored in the research log.
                                                     │
   triggers: start-up · every 60 s · window "online" · new results · settings saved · "Publish now"
                                                     ▼
- flush(): configured & sharing? ─ cross-tab lock ─ oldest PENDING first (≤ 50 per request)
+ flush(): configured & sharing? ─ cross-tab lock ─ refresh the index from storage ─ oldest PENDING first (≤ 50 per request)
           │ build report from the stored record (hashes computed now, `day` = when the post was seen)
           ├─ 2xx            → SENT (reports the server calls invalid → REJECTED)
           │    over the daily quota (code "quota") → stay PENDING, pause until the
@@ -89,6 +90,17 @@ Cheapest check first; every outcome is stored in the research log.
 ```
 
 A report is worth sending if it is a canonical claim judged false, or one whose proposition is already on the community list (a vote); jokes never qualify. Each entry's publish state is stored both in its record and in the index, and index merges between tabs keep the most advanced state.
+
+### Several tabs
+
+Every tab runs its own publisher over the same storage. Two things keep them from sending the same reports:
+
+1. **A lock** (`community/publish-lock.js`), in two layers:
+   - `navigator.locks` (Web Locks). Exclusive, and the browser frees it if the tab goes away. A lock manager belongs to one origin, so this covers tabs on the same Reddit host only.
+   - A lease under `rta.community.publishLock` in the userscript manager's storage, which all hosts share. It lasts 60 s and is renewed before each batch. It is **best effort**: taking it is a read followed by a write, and managers cache values per tab, so two tabs starting in the same instant can both take it.
+2. **A refresh.** Once it holds the lock, a tab merges the stored index into its own copy before it chooses what to send, so reports another tab sent earlier are skipped.
+
+What this adds up to: tabs on one host do not publish at the same time where the browser has Web Locks. Tabs on different hosts, or browsers without Web Locks, can still send the same batch once if they start together. The server is built for that: a report it already has from the same client for the same post is stored once, acknowledged, counted in `duplicates` and not charged to the daily quota. Not tried in a real userscript manager.
 
 With *Also share analyses made while offline or before I joined* switched off, only entries written after `communityJoinedAt` are sent.
 

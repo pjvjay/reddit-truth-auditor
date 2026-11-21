@@ -217,6 +217,43 @@ def test_rejections_carry_a_code_and_the_position_in_the_request(tmp_path, monke
     assert r["accepted"] == 0 and [(x["index"], x["code"]) for x in r["rejected"]] == [(0, "invalid")]
 
 
+def test_a_repeated_report_is_stored_once_and_costs_no_quota(tmp_path, monkeypatch):
+    api = limited(tmp_path, monkeypatch, 5)
+    cid = client_id()
+    first = [report(post=f"t3_{i}") for i in range(3)]
+    r = send(api, cid, first).json()
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (3, 0, 3)
+    # a second tab of the same install sends the same three again
+    r = send(api, cid, first).json()
+    assert (r["accepted"], r["duplicates"], r["rejected"], r["quota"]["used"]) == (3, 3, [], 3)
+    p = api.get(f"/v1/propositions/{canonicalize(WHO).key}").json()
+    assert p["counts"]["posts"] == 3 and p["counts"]["exposures"] == 3 and p["consensus"]["n_clients"] == 1
+    # so the quota still has room for two new reports; a repeat in the same batch does not use it up
+    r = send(api, cid, [report(post="t3_0"), report(post="t3_3"), report(post="t3_3"), report(post="t3_4"), report(post="t3_5")]).json()
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (4, 2, 5)
+    assert [(x["index"], x["code"]) for x in r["rejected"]] == [(4, "quota")]
+    # with the quota used up, repeats are still acknowledged (the client can mark them sent) and new reports wait
+    r = send(api, cid, [report(post="t3_1"), report(post="t3_9")]).json()
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (1, 1, 5)
+    assert [(x["index"], x["code"]) for x in r["rejected"]] == [(1, "quota")]
+    # another install reporting the same posts is not a repeat
+    r = send(api, client_id(), first).json()
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (3, 0, 3)
+
+
+def test_a_reworded_repeat_and_an_unusable_report_cost_no_quota(tmp_path, monkeypatch):
+    api = limited(tmp_path, monkeypatch, 2)
+    a = {"subject": "Bill Gates", "predicate": "funds", "object": "microchip implants hidden in vaccines for population tracking", "topic": "health"}
+    b = {**a, "object": "microchip implants hidden in vaccines for population tracking purposes"}   # merged into `a` as an alias
+    cid = client_id()
+    assert send(api, cid, [report(claim=a, post="t3_m")]).json()["quota"]["used"] == 1
+    r = send(api, cid, [report(claim=b, post="t3_n")]).json()          # new post: counts, and creates the alias
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (1, 0, 2)
+    r = send(api, cid, [report(claim=b, post="t3_m"), report(claim={"subject": "", "predicate": "is", "object": ""}, post="t3_x")]).json()
+    assert (r["accepted"], r["duplicates"], r["quota"]["used"]) == (1, 1, 2)      # same proposition and post as the first report
+    assert [(x["index"], x["code"]) for x in r["rejected"]] == [(1, "invalid")]
+
+
 def test_canonicalize_endpoint_matches_library(api):
     r = api.post("/v1/canonicalize", json={**WHO, "polarity": "denies"}).json()
     assert r["key"] == canonicalize(WHO).key and r["stance"] == "denies"
