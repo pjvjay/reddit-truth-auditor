@@ -11,7 +11,9 @@ POSTS = [
          truth=1, sarcasm=1, conf="high",
          fact="The WHO has published no such statement [1]. Radio waves cannot carry or spread viruses [2].",
          context="A recycled 2020 conspiracy theory presented as breaking news.",
-         verdict="False: the WHO never said this, and 5G cannot spread viruses."),
+         verdict="False: the WHO never said this, and 5G cannot spread viruses.",
+         canonical={"subject": "World Health Organization", "predicate": "states", "object": "5G towers spread the coronavirus",
+                    "polarity": "affirms", "quantities": [], "time": None, "place": None, "topic": "health"}),
     dict(id="hike02", sub="hiking", type="text",
          title="What's your favourite beginner trail near Vancouver?",
          body="Moving there next month and would love some suggestions!", verifiable=False, ctype="question"),
@@ -75,10 +77,12 @@ DUPES = [
     # paraphrase -> extraction model says same_as -> research + audit skipped
     dict(_fake, id="fake01p", sub="skeptic", body="",
          title="The World Health Organization now says 5G masts are what spread the virus",
-         claim="The World Health Organization says 5G masts spread the virus.", same_as_of="fake01"),
+         claim="The World Health Organization says 5G masts spread the virus.", same_as_of="fake01",
+         canonical=dict(_fake["canonical"], object="5G masts spread viruses")),
     # different wording, identical extracted claim -> lexical claim match
     dict(_fake, id="fake01c", sub="askreddit", body="",
-         title="Apparently the WHO is shutting down mobile networks worldwide because 5G spreads the virus"),
+         title="Apparently the WHO is shutting down mobile networks worldwide because 5G spreads the virus",
+         canonical=dict(_fake["canonical"], predicate="orders", object="worldwide mobile network shutdown over 5G virus spread")),
     # same sentence but a different number -> must NOT be reused
     dict(_F["mixed05"], id="mixed05n", title="Inflation just fell to 3%, the lowest level in 50 years",
          claim="Inflation fell to 3%, the lowest level in 50 years.", truth=3,
@@ -104,19 +108,22 @@ TONE = [
          verdict="Accurate: the sarcastic post correctly mocks the microchip myth."),
     # same words as the flagged fake01 plus "/s" -> must NOT inherit fake01's verdict
     dict(_fake, id="sarc5g", title=_fake["title"] + " /s", tone="sarcastic", literal=_fake["claim"],
+         canonical=dict(_fake["canonical"], polarity="denies"),
          claim="The WHO has not confirmed that 5G towers spread the virus.", truth=10, sarcasm=8,
          verdict="Accurate: the post is mocking the 5G myth."),
     # satire in its own subreddit -> skipped for free
     dict(id="bee01v", sub="babylonbee", type="link", url=BEE_URL, body="",
          title="Congress votes to replace the national anthem with a Nickelback song", verifiable=True, ctype="meme/satire",
          tone="satirical", paf=False, claim="Congress voted to replace the national anthem with a Nickelback song.",
-         truth=0, sarcasm=10, conf="high", fact="Babylon Bee satire.", context="", verdict="Satire."),
+         truth=0, sarcasm=10, conf="high", fact="Babylon Bee satire.", context="", verdict="Satire.", canonical=None),
     # the same satire link posted sincerely in r/politics -> satire passed off as news -> flagged, no reuse
     dict(id="bee01", sub="politics", type="link", url=BEE_URL, body="",
          title="Congress votes to replace the national anthem with a Nickelback song", verifiable=True, ctype="politics",
          tone="satirical", paf=True, claim="Congress voted to replace the national anthem with a Nickelback song.",
          truth=0, sarcasm=9, conf="high", fact="The story comes from the satire site Babylon Bee [1]; no such vote happened.",
-         context="Satire shared as if it were real news.", verdict="False: this is a Babylon Bee satire article, not real news."),
+         context="Satire shared as if it were real news.", verdict="False: this is a Babylon Bee satire article, not real news.",
+         canonical={"subject": "United States Congress", "predicate": "approves", "object": "replacing the national anthem with a Nickelback song",
+                    "polarity": "affirms", "quantities": [], "time": None, "place": "United States", "topic": "politics"}),
     # evident joke in a humour sub -> tone-skipped after the extraction call only
     dict(id="meme01", sub="funny", type="text", flair="Humor", title="Scientists confirm cats are technically a liquid",
          body="", verifiable=True, ctype="meme/satire", tone="humorous", paf=False,
@@ -126,8 +133,43 @@ TONE = [
          tone="humorous", paf=False, same_as_of="fake01", sarcasm=9,
          verdict="A joke about the 5G conspiracy theory; the literal claim is false."),
 ]
-ALL = POSTS + DUPES + TWINS + TONE
+# Served on /r/community: new posts a 4th user meets after 3 others reported the originals
+COMMUNITY = [
+    # a fresh paraphrase of the WHO/5G lie -> same canonical proposition -> community verdict (extraction only)
+    dict(_fake, id="fake01q", sub="conspiracy", body="", title="WHO finally admits 5G masts are spreading the virus",
+         claim="The World Health Organization admitted that 5G masts spread the virus."),
+    # a post DEBUNKING it -> same proposition, opposite stance -> not flagged
+    dict(_fake, id="debunk01", sub="skeptic", body="The WHO has said no such thing.",
+         title="No, the WHO did not say 5G spreads the virus", claim="The WHO did not state that 5G towers spread the virus.",
+         truth=10, verdict="Accurate.", canonical=dict(_fake["canonical"], polarity="denies")),
+    # the Babylon Bee link again, in yet another subreddit -> known spreading link -> zero LLM calls
+    dict(TONE[3], id="bee01c", sub="conservative", title="Finally! Congress ditches the anthem for Nickelback"),
+]
+# Served on /r/narrative: the 5G/COVID narrative carried by several outlets in different wordings
+_n = dict(verifiable=True, ctype="news", sarcasm=0, conf="high", context="", fact="No evidence; debunked [1].", body="")
+NARRATIVE = [
+    dict(_n, id="ncnn", sub="news", type="link", url="https://edition.cnn.com/2026/02/20/health/5g-covid/index.html",
+         title="WHO official says 5G towers spread the coronavirus", claim=_fake["claim"], truth=1, verdict="False: no WHO statement exists.",
+         canonical=_fake["canonical"], score=5400, comments=900, crossposts=6),
+    dict(_n, id="nfox", sub="conservative", type="link", url="https://www.foxnews.com/opinion/5g-radiation-covid-symptoms",
+         title="Opinion: 5G radiation is behind your COVID symptoms", claim="5G radiation causes coronavirus symptoms.", truth=0.5,
+         verdict="False: radio waves cannot cause viral symptoms.", score=3100, comments=640, crossposts=3,
+         canonical={"subject": "5G radiation", "predicate": "causes", "object": "coronavirus symptoms", "polarity": "affirms", "quantities": [], "topic": "health"}),
+    dict(_n, id="nbbc", sub="unitedkingdom", type="link", url="https://www.bbc.co.uk/news/uk-5g-towers-ban",
+         title="UK government bans 5G towers to stop coronavirus spread", claim="The UK government banned 5G towers to stop coronavirus spread.", truth=1,
+         verdict="False: no such ban.", score=2200, comments=410, crossposts=1,
+         canonical={"subject": "United Kingdom government", "predicate": "bans", "object": "5G towers to stop coronavirus spread",
+                    "polarity": "affirms", "quantities": [], "place": "United Kingdom", "topic": "health"}),
+    dict(_n, id="ntxt", sub="conspiracy", type="text", title="According to Fox News the WHO now admits 5G spreads the virus",
+         body="Saw it on Fox this morning.", claim=_fake["claim"], truth=1, verdict="False.", canonical=_fake["canonical"],
+         attributed={"outlet": "Fox News", "kind": "news"}, score=800, comments=120, crossposts=0),
+]
+ALL = POSTS + DUPES + TWINS + TONE + COMMUNITY + NARRATIVE
 BY_ID = {f"t3_{p['id']}": p for p in ALL}
+
+
+import time as _time
+CREATED_UTC = int(_time.time()) - 3 * 3600
 
 
 def permalink(p):
@@ -147,6 +189,8 @@ def by_id_json(ids):
             "domain": f"self.{p['sub']}" if p["type"] == "text" else "example.com",
             "permalink": permalink(p), "author": "someone",
             **({"crosspost_parent": p["crosspost"]} if p.get("crosspost") else {}),
+            "score": p.get("score", 1200), "num_comments": p.get("comments", 348), "upvote_ratio": 0.87,
+            "num_crossposts": p.get("crossposts", 2), "subreddit_subscribers": 1_500_000, "created_utc": CREATED_UTC,
         }})
     return json.dumps({"kind": "Listing", "data": {"children": children}})
 
@@ -159,6 +203,7 @@ def shreddit_page(posts=None):
         body = f'<div slot="text-body"><div id="t3_{p["id"]}-post-rtjson-content" class="md">{e(p["body"])}</div></div>' if p["body"] else ""
         arts.append(f'''<article aria-label="{e(p["title"])}">
 <shreddit-post id="t3_{p["id"]}" permalink="{permalink(p)}" post-title="{e(p["title"])}" subreddit-prefixed-name="r/{p["sub"]}"
+  score="{p.get("score", 1200)}" comment-count="{p.get("comments", 348)}" created-timestamp="2026-02-26T09:00:00.000000+0000"
   post-type="{p["type"]}" domain="{"self." + p["sub"] if p["type"] == "text" else "example.com"}" author="someone"
   content-href="{e(p.get("url") or "https://www.reddit.com" + permalink(p))}">
   <div class="credit"><span class="sub">r/{p["sub"]}</span> • 3 hr. ago <span class="join">Join</span><span class="dots">···</span></div>
@@ -234,7 +279,10 @@ def llm_reply(body):
         if not p["verifiable"]:
             return {"is_verifiable": False, "content_type": p["ctype"], "summary": "A user asks for hiking suggestions.", "claim": "", "query": ""}
         out = {"is_verifiable": True, "content_type": p["ctype"], "summary": p["title"], "claim": p["claim"], "query": "verify: " + p["claim"][:60],
-               "tone": _tone(p), "tone_confidence": "high", "presented_as_fact": p.get("paf", False), "literal_claim": p.get("literal", "")}
+               "tone": _tone(p), "tone_confidence": "high", "presented_as_fact": p.get("paf", False), "literal_claim": p.get("literal", ""),
+               "attributed_source": p.get("attributed"),
+               "canonical": p["canonical"] if "canonical" in p else {"subject": "r/" + p["sub"], "predicate": "states", "object": p["claim"],
+                                                                    "polarity": "affirms", "quantities": [], "topic": "other"}}
         if "Previously fact-checked claims" in user:
             out["same_as"] = None
             if p.get("same_as_of"):

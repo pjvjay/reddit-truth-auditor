@@ -5,8 +5,9 @@ Runs the real userscript in headless Chromium against mock Reddit pages, with
 Tampermonkey's GM_* API shimmed and OpenAI / Tavily / reddit.com intercepted.
 No network access or API keys needed.
 
-    pip install playwright && playwright install chromium
-    python userscript/tests/test_userscript.py            # screenshots -> userscript/tests/screenshots/
+    npm run build                                          # -> dist/reddit-truth-auditor.user.js
+    pip install playwright fastapi httpx && playwright install chromium
+    python userscript/test/e2e/test_userscript.py          # screenshots -> userscript/test/e2e/screenshots/
 """
 import json
 import os
@@ -21,8 +22,11 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).parent))
 import fixtures as fx  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "server" / "src"))
+
 HERE = Path(__file__).parent
-SCRIPT = (HERE.parent / "reddit-truth-auditor.user.js").read_text(encoding="utf-8")
+ROOT = HERE.parents[2]
+SCRIPT = (ROOT / "dist" / "reddit-truth-auditor.user.js").read_text(encoding="utf-8")
 SHOTS = Path(os.environ.get("RTA_SHOTS", HERE / "screenshots"))
 SHOTS.mkdir(parents=True, exist_ok=True)
 
@@ -56,14 +60,17 @@ CORS = {"access-control-allow-origin": "*", "access-control-allow-headers": "*",
 
 class Harness:
     def __init__(self, browser, settings=None, delay=500, width=1440, height=900, page_kind="shreddit",
-                 openai_status=200, ctx=None, by_id_status=200, store=None):
+                 openai_status=200, ctx=None, by_id_status=200, store=None, community=None):
         self.calls = {"openai": [], "tavily": [], "by_id": []}
         self.by_id_status = by_id_status
+        self.community = community              # fastapi TestClient of server/app.py, or None
+        self.community_posts, self.community_requests, self.community_down = [], 0, False
         self.openai_status = openai_status
         self.ctx = ctx or browser.new_context(viewport={"width": width, "height": height}, accept_downloads=True)
         self.page = self.ctx.new_page()
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
-        self.page.on("console", lambda m: m.type == "error" and self.errors.append("console: " + m.text))
+        # JS errors fail tests; the browser's own network logs (simulated 4xx/5xx responses) do not
+        self.page.on("console", lambda m: m.type == "error" and "Failed to load resource" not in m.text and self.errors.append("console: " + m.text))
         self.errors = []
         init = dict(store or {})
         if settings is not None:
@@ -76,6 +83,7 @@ class Harness:
         self.page.route("https://old.reddit.com/**", self._reddit)
         self.page.route("https://api.openai.com/**", self._openai)
         self.page.route("https://api.tavily.com/**", self._tavily)
+        self.page.route("https://community.test/**", self._community)
         self.page_kind = page_kind
 
     def _reddit(self, route):
@@ -90,6 +98,10 @@ class Harness:
             body = fx.old_reddit_page()
         elif u.path.startswith("/r/dupes"):
             body = fx.shreddit_page(fx.DUPES)
+        elif u.path.startswith("/r/narrative"):
+            body = fx.shreddit_page(fx.NARRATIVE)
+        elif u.path.startswith("/r/community"):
+            body = fx.shreddit_page(fx.COMMUNITY)
         elif u.path.startswith("/r/tone"):
             body = fx.shreddit_page(fx.TONE)
         elif u.path.startswith("/r/twins"):
@@ -116,6 +128,30 @@ class Harness:
         body = json.loads(route.request.post_data or "{}")
         self.calls["tavily"].append({"headers": route.request.headers, "body": body})
         route.fulfill(status=200, headers=CORS, content_type="application/json", body=json.dumps(fx.tavily_reply(body)))
+
+    def _community(self, route):
+        req = route.request
+        if req.method == "OPTIONS":
+            return route.fulfill(status=204, headers=CORS)
+        self.community_requests += 1
+        if self.community is None or self.community_down:
+            return route.fulfill(status=503, headers=CORS, body="unavailable")
+        u = urlparse(req.url)
+        path = u.path + (f"?{u.query}" if u.query else "")
+        headers = {k: v for k, v in req.headers.items() if k.lower() in ("content-type", "x-rta-token")}
+        if req.method == "POST":
+            self.community_posts.append(json.loads(req.post_data))
+            resp = self.community.post(path, content=req.post_data, headers=headers)
+        else:
+            resp = self.community.get(path, headers=headers)
+        route.fulfill(status=resp.status_code, body=resp.content,
+                      headers={**CORS, "content-type": resp.headers.get("content-type", "application/json")})
+
+    def flush_reports(self, timeout=15000):
+        """Push the outbox to the community server and wait until it is empty."""
+        self.page.wait_for_timeout(300)
+        self.page.wait_for_function("""(() => { const R = window.__RTA_TEST__.Reporter;
+            if (!R.busy && R.pending()) R.flush(true); return !R.busy && R.pending() === 0; })()""", timeout=timeout, polling=150)
 
     def goto(self, old=False, path="/"):
         self.page.goto("https://old.reddit.com/" if old else "https://www.reddit.com" + path)
@@ -626,7 +662,7 @@ def duplicates_reuse_earlier_verdicts(browser):
     with h.page.expect_download() as dl:
         h.page.locator('.btn-icon[aria-label="Export CSV"]').click()
     text = Path(dl.value.path()).read_text(encoding="utf-8-sig")
-    check(text.splitlines()[0].endswith("reused_from,reuse_via,tone,presented_as_fact,effective_risk"), "csv header")
+    check(text.splitlines()[0].endswith("reused_from,reuse_via,tone,presented_as_fact,effective_risk,proposition_key,stance,canonical_claim,publish_state"), "csv header")
     check(any("t3_fake01b" in l and '"t3_fake01"' in l and '"text"' in l for l in text.splitlines()), "dup row in csv")
     check(not h.errors, f"page errors: {h.errors}")
     h.close()
@@ -788,9 +824,13 @@ def sarcasm_and_satire_are_understood(browser):
     audit = [c for c in h.calls_mentioning("Claim: Vaccines do not contain") if "Audit this claim" in c["body"]["messages"][-1]["content"]][0]["body"]["messages"][-1]["content"]
     check("INTENDED meaning" in audit and "Vaccines contain 5G microchips" in audit, "audit told about the ironic wording")
 
-    # "/s" copy of the flagged post: same words, opposite meaning -> never reused from fake01
-    check(not h.result("sarc5g").get("dupOf"), "sarcastic copy not reused from the sincere post")
-    check(len(h.calls_mentioning("Title: " + fx.TONE[1]["title"])) == 2, "sarcastic copy got its own check")
+    # "/s" copy of the flagged post: same words, opposite meaning. Word-level (tier 1) reuse is blocked by the
+    # sarcasm framing; after extraction the decoded claim maps to the SAME proposition with the OPPOSITE stance,
+    # so fake01's verdict is reused with the truth score inverted (1 -> 9) instead of being copied.
+    s5 = h.result("sarc5g")
+    check(s5["dupOf"]["via"] == "proposition" and s5["canon"]["stance"] == "denies", f"matched by proposition {s5.get('dupOf')}")
+    check(s5["truth"] == 9 and "Rejects a claim already judged false" in s5["verdict"], f"truth inverted {s5['truth']} {s5['verdict']}")
+    check(len(h.calls_mentioning("Title: " + fx.TONE[1]["title"])) == 1, "only the extraction call")
     check("flagged" not in h.card_classes("sarc5g"), "sarcastic copy not flagged")
 
     # satire in its own subreddit: free skip; same link passed off as news elsewhere: flagged
@@ -863,6 +903,371 @@ def check_anyway_audits_skipped_satire(browser):
     check(r["kind"] == "audit" and r["tone"] == "satirical" and r["presentedAsFact"] is False, "audited as satire")
     check("flagged" not in h.card_classes("bee01v"), "evident satire stays below the threshold (discounted)")
     check(h.page.evaluate("window.__RTA_TEST__.effectiveRisk(window.__RTA_TEST__.Log.get('t3_bee01v'))") == 20, "100% literal risk -> 20%")
+    h.close()
+
+
+# ----------------------------------------------------------------------------- canonical claims & community network
+CS = dict(BASE, dwellMs=150, communityEnabled=True, communityUrl="https://community.test")
+
+
+def community_server(tmpdir):
+    os.environ["RTA_FEED_MIN_CLIENTS"] = "3"
+    os.environ.pop("RTA_PUBLISH_TOKENS", None)
+    from rta_server import app as server_app
+    from fastapi.testclient import TestClient
+    return TestClient(server_app.create_app(str(Path(tmpdir) / "community.sqlite3")))
+
+
+@test
+def canonical_keys_match_server(browser):
+    from rta_server.claimsig import canonicalize, hash_ref, tokenize
+    corpus = [
+        {"subject": "World Health Organization", "predicate": "states", "object": "5G towers spread the coronavirus", "polarity": "affirms"},
+        {"subject": "world health organisation", "predicate": "does not state", "object": "the coronavirus spreading 5G towers"},
+        {"subject": "Canada", "predicate": "sets", "object": "permanent resident admissions target of 380,000", "time": "2026", "quantities": []},
+        {"subject": "Canada", "predicate": "set", "object": "PR target", "quantities": [{"value": 380000}, {"value": "1.5%"}, {"value": "12,000,000"}], "place": "Canada"},
+        {"subject": "Emmanuel Macron", "predicate": "didn't ban", "object": "croissants in Île-de-France", "polarity": "denies"},
+        {"subject": "U.S. Congress", "predicate": "approves", "object": "Nickelback song as anthem", "quantities": [{"value": 0.1 + 0.2}, {"value": -0.0}, {"value": 1e9}, {"value": "abc"}, {"value": True}]},
+        {"subject": "Vaccines", "predicate": "contain", "object": "5G microchips", "polarity": "DENIES", "time": "2021-03-04", "place": None},
+        {"subject": "", "predicate": "is", "object": ""},
+        {"subject": "A", "predicate": "is", "object": "b"},
+        "not a dict",
+    ]
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=0)
+    h.goto()
+    js = h.page.evaluate("""async (corpus) => Promise.all(corpus.map(async (c) => {
+        const r = await window.__RTA_TEST__.canonicalize(c); return r ? [r.key, r.stance, r.canonical, r.tokens] : null; }))""", corpus)
+    py = [[c.key, c.stance, c.canonical, c.tokens] if (c := canonicalize(x)) else None for x in corpus]
+    for a, b, x in zip(js, py, corpus):
+        check(a == b, f"JS/Python canonical mismatch for {x}:\n  js={a}\n  py={b}")
+    texts = ["Didn't the WHO say 5G spreads COVID-19?!", "Inflation fell to 1.5% in 2024 – 380,000 jobs", "Café ÉLITE’s owners aren't   here…", "...a.b.. 3.14. %"]
+    jt = h.page.evaluate("(ts) => ts.map((t) => [...window.__RTA_TEST__.tokenize(t)])", texts)
+    check(jt == [tokenize(t) for t in texts], f"tokenize parity {jt} vs {[tokenize(t) for t in texts]}")
+    check(h.page.evaluate("window.__RTA_TEST__.hashRef('t3_fake01')") == hash_ref("t3_fake01"), "hashRef parity")
+    h.close()
+
+
+@test
+def community_is_off_by_default(browser):
+    import tempfile
+    srv = community_server(tempfile.mkdtemp())
+    h = Harness(browser, settings=BASE, delay=60, community=srv)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(2000)
+    check(h.community_requests == 0, "no community traffic unless the user opts in")
+    check(h.page.evaluate("window.__RTA_TEST__.Log.pendingCount()") >= 1, "mistruth queued locally for later (offline-first)")
+    check(h.result("fake01")["canon"]["key"].startswith("p1_"), "canonical claim still computed (used for local matching)")
+    h.close()
+
+
+@test
+def local_proposition_match_handles_both_stances(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=150), delay=80, ctx=ctx)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(1000)
+    h.goto(path="/r/community/")
+    for pid in ["fake01q", "debunk01"]:
+        h.scroll_to(pid)
+        h.wait_card_state(pid, "done")
+    q, d = h.result("fake01q"), h.result("debunk01")
+    check(q["dupOf"]["via"] == "proposition" and q["truth"] == 1 and "flagged" in h.card_classes("fake01q"), "paraphrase reuses verdict")
+    check(d["dupOf"]["via"] == "proposition" and d["truth"] == 9 and "flagged" not in h.card_classes("debunk01"), "debunk gets inverted verdict")
+    for pid in ["fake01q", "debunk01"]:
+        title = next(p["title"] for p in fx.COMMUNITY if p["id"] == pid)
+        check(len(h.calls_mentioning(f"Title: {title}")) == 1, f"{pid}: extraction only")
+    h.close()
+
+
+@test
+def community_network_end_to_end(browser):
+    import re
+    import tempfile
+    from rta_server.claimsig import hash_ref
+    srv = community_server(tempfile.mkdtemp())
+
+    # --- three independent users audit the originals and publish anonymous reports
+    sent = []
+    for _ in range(3):
+        h = Harness(browser, settings=CS, delay=60, community=srv)
+        h.goto()
+        h.wait_card_state("fake01", "done")
+        h.flush_reports()
+        h.goto(path="/r/tone/")
+        h.scroll_to("bee01")
+        h.wait_card_state("bee01", "done")
+        h.flush_reports()
+        sent += h.community_posts
+        h.close()
+
+    # --- privacy: exactly the documented fields, hashed ids, no post text
+    allowed = {"claim", "key", "claim_truth", "confidence", "tone", "presented_as_fact", "researched", "sources", "verdict",
+               "model", "post", "subreddit", "url_hash", "day", "origin", "source", "attributed", "engagement", "post_day"}
+    clients = set()
+    for body in sent:
+        check(set(body) == {"schema", "client", "reports"} and body["schema"] == "rta.report/1", "envelope")
+        clients.add(body["client"])
+        for r in body["reports"]:
+            check(set(r) == allowed, f"unexpected fields {set(r) ^ allowed}")
+            blob = json.dumps(r)
+            for secret in ["t3_", "Sources inside the WHO", "BREAKING", "/comments/", "someone", "babylonbee.com/news",
+                           fx.POSTS[0]["title"], "Congress votes to replace the national anthem with a Nickelback song"]:
+                check(secret not in blob, f"leaked {secret!r}: {blob[:200]}")
+            check(re.fullmatch(r"[0-9a-f]{32}", r["post"]), "post id hashed")
+    check(len(clients) == 3, "three distinct anonymous ids")
+    check(any(r["post"] == hash_ref("t3_fake01") for b in sent for r in b["reports"]), "post hash = sha256('rta1:'+id)")
+
+    # --- the server agrees these are mistruths and counts them
+    feed = srv.get("/v1/propositions/feed").json()["items"]
+    who = next(i for i in feed if i["claim"]["subject"] == "World Health Organization")
+    bee = next(i for i in feed if i["claim"]["subject"] == "United States Congress")
+    check(who["consensus"]["n_clients"] == 3 and who["consensus"]["status"] == "false", f"WHO consensus {who['consensus']}")
+    check(who["counts"]["spreading"] == 1, f"one spreading post (fake01) {who['counts']}")
+    check(srv.app.state.store.db.execute("SELECT COUNT(*) FROM sightings WHERE key=? AND stance='affirms'", (who["key"],)).fetchone()[0] == 3,
+          "...seen by three users (3 exposures)")
+    bee_link = hash_ref("babylonbee.com/news/congress-votes-to-replace-national-anthem-with-nickelback-song")
+    check(bee["url_hashes"] == [bee_link], "spreading link published once 3 users reported it")
+    check(bee["consensus"]["tone"] == "satire-as-fact", "satire passed off as fact recorded")
+
+    # --- a fourth user benefits: known mistruths recognised without research or audit
+    hd = Harness(browser, settings=CS, delay=60, community=srv)
+    hd.goto(path="/r/community/")
+    hd.page.wait_for_function("window.__RTA_TEST__.Community.items.length >= 2", timeout=8000)
+    for p in fx.COMMUNITY:
+        hd.scroll_to(p["id"])
+        hd.page.wait_for_timeout(250)
+    for p in fx.COMMUNITY:
+        hd.wait_card_state(p["id"], "done")
+    q, d, b = hd.result("fake01q"), hd.result("debunk01"), hd.result("bee01c")
+    check(q["community"]["via"] == "key" and "flagged" in hd.card_classes("fake01q"), f"paraphrase matched by proposition key {q.get('community')}")
+    check(d["community"]["via"] == "key" and d["truth"] >= 9 and "flagged" not in hd.card_classes("debunk01"), "debunking post recognised")
+    check(d["verdict"].startswith("Debunks a known mistruth"), d["verdict"])
+    check(b["community"]["via"] == "link" and "flagged" in hd.card_classes("bee01c"), "known spreading link matched")
+    check(hd.pill_text("bee01c").startswith("Satire passed off as news"), hd.pill_text("bee01c"))
+    check(not hd.calls_mentioning("Finally! Congress"), "link match cost zero tokens")
+    check(len(hd.calls_mentioning("Title: WHO finally admits")) == 1, "paraphrase: extraction only")
+    check(not hd.calls_mentioning("Audit this claim") and not hd.calls["tavily"], "no research/audit at all for user 4")
+    check("Known mistruth" in hd.card("fake01q").locator(".reuse.community").text_content(), "community note shown")
+    if not hd.panel_open():
+        hd.page.locator(".launcher").click()
+    hd.card("fake01q").scroll_into_view_if_needed()
+    hd.shot("16-community-match")
+
+    # user 4's sightings add to frequency metrics but never to the vote
+    hd.flush_reports()
+    who2 = srv.get(f"/v1/propositions/{who['key']}").json()
+    check(who2["consensus"]["n_clients"] == 3, "community-derived results do not vote")
+    check(who2["counts"]["spreading"] == who["counts"]["spreading"] + 1 and who2["counts"]["debunking"] == who["counts"]["debunking"] + 1,
+          f"user 4's spreading + debunking posts counted {who['counts']} -> {who2['counts']}")
+    top = srv.get("/v1/propositions/top?sort=posts").json()["items"]
+    check(top[0]["key"] == who["key"], "WHO/5G is the most widespread mistruth")
+
+    # settings status + dashboard
+    hd.page.locator('.btn-icon[aria-label="Settings"]').click()
+    hd.page.wait_for_selector(".comm-status")
+    status = hd.page.locator(".comm-status").text_content()
+    check(f"{len(srv.get('/v1/propositions/feed').json()['items'])} known mistruths" in status and "null" not in status, status)
+    hd.page.locator(".sec", has_text="Community network").scroll_into_view_if_needed()
+    hd.shot("17-community-settings")
+    dash = browser.new_page(viewport={"width": 1300, "height": 700})
+    dash.route("https://community.test/**", lambda route: route.fulfill(status=200, content_type="text/html", body=srv.get("/").text))
+    dash.goto("https://community.test/")
+    check("World Health Organization" in dash.content(), "dashboard lists it")
+    dash.screenshot(path=str(SHOTS / "18-community-dashboard.png"))
+    dash.close()
+    check(not hd.errors, f"page errors: {hd.errors}")
+    hd.close()
+
+
+@test
+def reports_retry_when_server_is_down(browser):
+    import tempfile
+    srv = community_server(tempfile.mkdtemp())
+    h = Harness(browser, settings=CS, delay=60, community=srv)
+    h.community_down = True
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(500)
+    h.page.evaluate("window.__RTA_TEST__.Reporter.flush(true)")
+    h.page.wait_for_timeout(800)
+    check(h.page.evaluate("window.__RTA_TEST__.Reporter.pending()") >= 1, "kept in outbox while the server is down")
+    check("503" in (h.page.evaluate("GM_getValue('rta.community.status', {})").get("sendError") or ""), "error recorded")
+    h.community_down = False
+    h.flush_reports()
+    check(srv.get("/v1/stats").json()["reporters"] == 1, "delivered after recovery")
+    h.close()
+
+
+@test
+def source_kinds_detected_from_links(browser):
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=0)
+    h.goto()
+    r = h.page.evaluate("""() => {
+      const f = (url) => window.__RTA_TEST__.sourceOf({ url });
+      return {
+        news: f('https://edition.cnn.com/2026/02/20/health/5g/index.html'),
+        opinion: f('https://www.foxnews.com/opinion/5g-radiation'),
+        guardian: f('https://www.theguardian.com/commentisfree/2026/feb/20/x'),
+        analysis: f('https://www.bbc.co.uk/news/analysis/x'),
+        video: f('https://www.youtube.com/watch?v=abc'),
+        social: f('https://x.com/someone/status/1'),
+        blog: f('https://someone.substack.com/p/x'),
+        reddit: f('https://i.redd.it/abc.jpg'),
+        none: f(''),
+      };
+    }""")
+    check(r["news"] == {"domain": "edition.cnn.com", "kind": "news"}, r["news"])
+    check(r["opinion"]["kind"] == r["guardian"]["kind"] == "opinion" and r["opinion"]["domain"] == "foxnews.com", "opinion pieces")
+    check((r["analysis"]["kind"], r["video"]["kind"], r["social"]["kind"], r["blog"]["kind"]) == ("analysis", "video", "social", "blog"), r)
+    check(r["reddit"] is None and r["none"] is None, "reddit-hosted media / self posts are not a source")
+    h.close()
+
+
+@test
+def narratives_are_clustered_across_outlets(browser):
+    import tempfile
+    srv = community_server(tempfile.mkdtemp())
+    sent = []
+    for _ in range(3):
+        h = Harness(browser, settings=CS, delay=50, community=srv)
+        h.goto(path="/r/narrative/")
+        for p in fx.NARRATIVE:
+            h.scroll_to(p["id"])
+            h.page.wait_for_timeout(250)
+        for p in fx.NARRATIVE:
+            h.wait_card_state(p["id"], "done")
+        h.flush_reports()
+        sent += h.community_posts
+        h.close()
+
+    # reports carry host + article kind + popularity - never the URL path
+    reps = [r for b in sent for r in b["reports"]]
+    blob = json.dumps(reps)
+    for path in ["5g-covid", "/opinion/", "index.html", "uk-5g-towers-ban", "https://edition"]:
+        check(path not in blob, f"URL path leaked: {path}")
+    srcs = {(r["source"] or {}).get("domain"): (r["source"] or {}).get("kind") for r in reps}
+    check(srcs.get("edition.cnn.com") == "news" and srcs.get("foxnews.com") == "opinion" and srcs.get("bbc.co.uk") == "news", srcs)
+    check(any(r["attributed"] == {"outlet": "Fox News", "kind": "news"} for r in reps), "outlet cited in a text post")
+    check(all(r["engagement"] and r["engagement"]["score"] > 0 and r["post_day"] for r in reps), "engagement + post day sent")
+
+    # the server clusters the different wordings into one narrative carried by 3 independent sources
+    items = srv.get("/v1/clusters").json()["items"]
+    check(len(items) == 1, f"one narrative {[(c['label'], len(c['members'])) for c in items]}")
+    c = items[0]
+    m = c["metrics"]
+    check(len(c["members"]) == 3, f"WHO / radiation / UK-ban variants clustered {[x['sentence'] for x in c['members']]}")
+    check(m["independent_sources"] == 3 and {o["outlet"] for o in m["outlets"]} == {"CNN", "Fox News", "BBC"}, f"sources {m['outlets']}")
+    check(m["article_kinds"].get("opinion") == 1, f"opinion piece counted {m['article_kinds']}")
+    check(m["score"] == sum(p["score"] for p in fx.NARRATIVE), f"engagement aggregated {m['score']}")
+    check(c["members"][0]["sentence"].startswith("World Health Organization") and c["members"][0]["share"] > 0.4, "most-pushed claim weighs most")
+    check(c["severity"]["score"] > 30, f"severity {c['severity']}")
+
+    # a fourth user sees the narrative context on a matching post and in the Trends tab
+    hd = Harness(browser, settings=CS, delay=50, community=srv)
+    hd.goto()
+    hd.page.wait_for_function("window.__RTA_TEST__.Community.items.length >= 1", timeout=8000)
+    hd.wait_card_state("fake01", "done")
+    note = hd.card("fake01").locator(".reuse.narrative").text_content()
+    check("false narrative" in note and "3 independent sources" in note and "CNN" in note, note)
+    if not hd.panel_open():
+        hd.page.locator(".launcher").click()
+    hd.page.locator(".tab.trend").click()
+    hd.page.wait_for_selector(".tcard", timeout=5000)
+    tc = hd.page.locator(".tcard").first.text_content()
+    check("Fox News · opinion" in tc and "of weight" in tc and "independent sources" in tc, tc)
+    hd.page.locator(".tcard summary").first.click()
+    hd.shot("19-trends-tab")
+    hd.page.locator(".tab.live").click()
+    hd.card("fake01").scroll_into_view_if_needed()
+    hd.shot("20-narrative-note")
+    dash = browser.new_page(viewport={"width": 1300, "height": 900})
+    dash.route("https://community.test/**", lambda route: route.fulfill(status=200, content_type="text/html", body=srv.get("/?days=7").text))
+    dash.goto("https://community.test/")
+    dash.screenshot(path=str(SHOTS / "21-dashboard-narratives.png"))
+    dash.close()
+    check(not hd.errors, f"page errors: {hd.errors}")
+    hd.close()
+
+
+# ----------------------------------------------------------------------------- offline-first
+@test
+def offline_first_backlog_published_after_joining(browser):
+    import tempfile
+    srv = community_server(tempfile.mkdtemp())
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=150), delay=60, community=srv, ctx=ctx)   # community NOT configured
+    h.goto(path="/r/narrative/")
+    for p in fx.NARRATIVE:
+        h.scroll_to(p["id"])
+        h.page.wait_for_timeout(200)
+    for p in fx.NARRATIVE:
+        h.wait_card_state(p["id"], "done")
+    h.page.wait_for_timeout(500)
+    pending = h.page.evaluate("window.__RTA_TEST__.Log.pendingCount()")
+    check(pending == 4, f"mistruths queued locally while not connected ({pending})")
+    check(h.community_requests == 0, "nothing sent before joining")
+
+    # join through the UI -> the backlog is published
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.page.locator('.btn-icon[aria-label="Settings"]').click()
+    h.page.wait_for_selector(".views.settings")
+    h.page.locator(".check", has_text="Join the community").locator("input").check()
+    h.page.locator('input[type="url"]').fill("https://community.test")
+    h.page.locator(".btn.primary", has_text="Save").click()
+    h.page.wait_for_function("window.__RTA_TEST__.Log.pendingCount() === 0", timeout=10000)
+    sent = sum(len(b["reports"]) for b in h.community_posts)
+    check(sent == 4, f"backlog published ({sent})")
+    check(srv.get("/v1/stats").json()["posts"] == 4, "server recorded the 4 posts")
+    days = {r["day"] for b in h.community_posts for r in b["reports"]}
+    check(len(days) == 1, "sighting day preserved")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def server_outage_keeps_working_and_recovers(browser):
+    import tempfile
+    srv = community_server(tempfile.mkdtemp())
+    h = Harness(browser, settings=CS, delay=60, community=srv)
+    h.community_down = True
+    h.goto(path="/r/narrative/")
+    for p in fx.NARRATIVE:
+        h.scroll_to(p["id"])
+        h.page.wait_for_timeout(200)
+    for p in fx.NARRATIVE:
+        h.wait_card_state(p["id"], "done")     # fact-checking continues without the server
+    h.page.evaluate("window.__RTA_TEST__.Reporter.flush(true)")
+    h.page.wait_for_timeout(800)
+    check(h.page.evaluate("window.__RTA_TEST__.Reporter.pending()") == 4, "reports kept locally")
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.page.locator(".banner.info", has_text="Community server unreachable").wait_for(timeout=5000)
+    foot = h.page.locator(".usage").text_content()
+    check("Community offline" in foot and "4 reports queued" in foot, foot)
+
+    # Trends: community view explains the outage; "My history" clusters locally
+    h.page.locator(".tab.trend").click()
+    h.page.wait_for_selector(".trends .banner.warn", timeout=5000)
+    check("unreachable" in h.page.locator(".trends .banner.warn").text_content(), "outage explained")
+    h.page.locator('.seg[data-src="local"]').click()
+    h.page.wait_for_selector(".trends .tcard", timeout=5000)
+    tc = h.page.locator(".trends .tcard").first.text_content()
+    check("World Health Organization" in tc or "5G" in tc, tc)
+    check("CNN" in tc and "Fox News · opinion" in tc and "BBC" in tc, f"local clustering uses the shared outlet registry: {tc}")
+    h.page.locator(".trends .tcard summary").first.click()
+    h.shot("22-offline-local-narratives")
+
+    # the server comes back -> everything queued is delivered, banner disappears
+    h.community_down = False
+    h.flush_reports()
+    check(srv.get("/v1/stats").json()["posts"] == 4, "delivered after recovery")
+    h.page.locator(".tab.live").click()
+    h.page.wait_for_timeout(300)
+    check(h.page.locator(".banner.info", has_text="Community server unreachable").count() == 0, "offline banner cleared")
+    check(not h.errors, f"page errors: {h.errors}")
     h.close()
 
 

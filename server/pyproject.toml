@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rta-community-server"
+version = "2.0.0"
+description = "Community API for Reddit Truth Auditor: anonymous mistruth reports, consensus, event clustering and severity metrics."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "pjvjay" }]
+dependencies = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+rta-server = "rta_server.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/pjvjay/reddit-truth-auditor"
+Documentation = "https://github.com/pjvjay/reddit-truth-auditor/blob/main/docs/community-api.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rta_server"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# single source of truth, shared with the userscript
+"../spec/outlets.json" = "rta_server/data/outlets.json"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+dist/** linguist-generated=true -diff
+spec/canonical-vectors.json linguist-generated=true
+spec/*.schema.json linguist-generated=true
+package-lock.json -diff

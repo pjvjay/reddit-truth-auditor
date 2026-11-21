@@ -1,0 +1,36 @@
+{
+  "name": "reddit-truth-auditor",
+  "version": "2.0.0",
+  "description": "Fact-checks the Reddit posts you are looking at and warns you about false or misleading content, with an optional community network for tracking propagating mistruths.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "homepage": "https://github.com/pjvjay/reddit-truth-auditor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pjvjay/reddit-truth-auditor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pjvjay/reddit-truth-auditor/issues"
+  },
+  "author": "pjvjay",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node userscript/build.mjs",
+    "watch": "node userscript/build.mjs --watch",
+    "lint": "eslint userscript",
+    "test": "npm run test:unit && npm run build && npm run test:e2e",
+    "test:unit": "node --test \"userscript/test/unit/*.test.mjs\"",
+    "test:e2e": "python3 userscript/test/e2e/test_userscript.py",
+    "test:server": "python3 -m pytest server/tests -q"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.39.5",
+    "globals": "^15.15.0",
+    "prettier": "^3.9.10"
+  }
+}

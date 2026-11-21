@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pjvjay/reddit-truth-auditor/spec/claim.schema.json",
+  "$defs": {
+    "Quantity": {
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Value"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "title": "Quantity",
+      "type": "object"
+    }
+  },
+  "description": "Canonical claim structure (rta.claim/1) - see server/README.md.",
+  "properties": {
+    "subject": {
+      "maxLength": 200,
+      "title": "Subject",
+      "type": "string"
+    },
+    "predicate": {
+      "default": "",
+      "maxLength": 80,
+      "title": "Predicate",
+      "type": "string"
+    },
+    "object": {
+      "default": "",
+      "maxLength": 300,
+      "title": "Object",
+      "type": "string"
+    },
+    "polarity": {
+      "default": "affirms",
+      "enum": [
+        "affirms",
+        "denies"
+      ],
+      "title": "Polarity",
+      "type": "string"
+    },
+    "quantities": {
+      "items": {
+        "$ref": "#/$defs/Quantity"
+      },
+      "maxItems": 8,
+      "title": "Quantities",
+      "type": "array"
+    },
+    "time": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Time"
+    },
+    "place": {
+      "anyOf": [
+        {
+          "maxLength": 80,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Place"
+    },
+    "topic": {
+      "anyOf": [
+        {
+          "maxLength": 30,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": "other",
+      "title": "Topic"
+    }
+  },
+  "required": [
+    "subject"
+  ],
+  "title": "rta.claim/1",
+  "type": "object"
+}

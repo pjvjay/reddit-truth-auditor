@@ -75,7 +75,7 @@ async def audit_post(post_data):
         # 3. Final Synthesis
         audit_chain = audit_prompt | llm | JsonOutputParser()
         res = audit_chain.invoke({
-            "date": "2026-02-26",
+            "date": datetime.now().strftime("%Y-%m-%d"),
             "query": info['query'],
             "report": report
         })
@@ -90,7 +90,7 @@ def save_result(row):
     with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['date','truth_score','sarcasm_score','subreddit','title','factual_check','verdict','url'])
         if not file_exists: writer.writeheader()
-        row['date'] = "2026-02-26"
+        row["date"] = datetime.now().strftime("%Y-%m-%d")
         writer.writerow(row)
 
 async def main():
