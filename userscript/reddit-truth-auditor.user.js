@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit Truth Auditor
 // @namespace    https://github.com/pjvjay/reddit-truth-auditor
-// @version      1.0.0
+// @version      1.1.0
 // @description  Fact-checks the Reddit posts you are looking at (LLM + optional live web research) and slides open a side panel when a post looks false or misleading.
 // @author       pjvjay
 // @match        https://www.reddit.com/*
@@ -12,6 +12,8 @@
 // @icon         https://www.reddit.com/favicon.ico
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
@@ -38,6 +40,11 @@
  *     -> LLM: audit claim -> truth_score, sarcasm_score, checks  (finalrun.py audit_prompt)
  *     -> risk = 100 - truth_score*10 ; panel opens if risk >= user threshold
  *
+ * Every result goes into a persistent local research log. Before spending any
+ * tokens a post is matched against that log (same id, crosspost, same link,
+ * near-identical text) and, after the cheap claim-extraction step, by claim
+ * (lexical + model-judged), so repeats and reposts reuse the earlier verdict.
+ *
  * All UI lives in a Shadow DOM so Reddit's CSS cannot break it (and vice versa).
  * DOM is built with createElement/textContent only (no innerHTML), so post
  * titles and model output can never inject markup.
@@ -49,12 +56,12 @@
   if (window.__RTA_LOADED__) return;
   window.__RTA_LOADED__ = true;
 
-  const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.0.0';
+  const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.1.0';
 
   // ---------------------------------------------------------------------------
   // Settings & storage
   // ---------------------------------------------------------------------------
-  const KEYS = { settings: 'rta.settings', cache: 'rta.cache', usage: 'rta.usage', welcomed: 'rta.welcomed' };
+  const KEYS = { settings: 'rta.settings', legacyCache: 'rta.cache', index: 'rta.idx', logPrefix: 'rta.log.', usage: 'rta.usage', stats: 'rta.stats', welcomed: 'rta.welcomed' };
 
   const DEFAULTS = {
     apiKey: '',
@@ -69,7 +76,10 @@
     dwellMs: 1200,            // how long a post must be on screen before it is checked
     maxConcurrent: 2,
     dailyBudgetUsd: 0.5,      // 0 = unlimited
-    cacheHours: 24,
+    logDays: 30,              // research log retention
+    maxLogEntries: 5000,
+    dedupe: true,             // reuse verdicts for reposts / near-duplicates / same claim
+    dupThreshold: 80,         // 50-100: word-overlap similarity needed to count as a duplicate
     subsAllow: '',
     subsBlock: '',
     referenceFacts: '',
@@ -105,6 +115,15 @@
   const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
   const safeUrl = (u) => { try { const x = new URL(u, location.href); return /^https?:$/.test(x.protocol) ? x.href : null; } catch (_) { return null; } };
   const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return ''; } };
+  const ago = (t) => {
+    const m = Math.round((Date.now() - t) / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m} min ago`;
+    const hr = Math.round(m / 60);
+    if (hr < 24) return `${hr} h ago`;
+    const d = Math.round(hr / 24);
+    return `${d} day${d === 1 ? '' : 's'} ago`;
+  };
   const subList = (s) => String(s || '').split(/[\s,]+/).map((x) => x.replace(/^\/?r\//i, '').toLowerCase()).filter(Boolean);
 
   function throttle(fn, ms) {
@@ -180,41 +199,316 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Result cache (persisted across tabs/page loads) & daily usage
+  // Text fingerprints & similarity (local, no tokens spent)
   // ---------------------------------------------------------------------------
-  const Cache = {
-    data: null,
-    MAX: 1000,
-    ttl() { return Math.max(0.05, Number(settings.cacheHours) || 24) * 3600e3; },
-    read() { const raw = GM_getValue(KEYS.cache, {}); return raw && typeof raw === 'object' ? raw : {}; },
-    load() { if (!this.data) { this.data = this.read(); this.prune(); } return this.data; },
-    get(id) {
-      const e = this.load()[id];
-      if (!e) return null;
-      if (Date.now() - e.t > this.ttl()) { delete this.data[id]; return null; }
-      return e.r;
-    },
-    put(id, r) { this.load()[id] = { t: Date.now(), r }; this.deleted.delete(id); this.saveSoon(); },
-    remove(id) { delete this.load()[id]; this.deleted.add(id); this.saveSoon(); },
-    prune() {
-      const now = Date.now(), ttl = this.ttl();
-      const keep = Object.entries(this.data).filter(([, e]) => e && e.r && now - e.t <= ttl).sort((a, b) => b[1].t - a[1].t).slice(0, this.MAX);
-      this.data = Object.fromEntries(keep);
-    },
-    save() {
-      // merge with whatever other tabs wrote meanwhile (newest entry wins)
-      const stored = this.read();
-      for (const [id, e] of Object.entries(stored)) if (!this.data[id] || this.data[id].t < e.t) this.data[id] = e;
-      for (const id of this.deleted) delete this.data[id];
-      this.deleted.clear();
-      this.prune();
-      GM_setValue(KEYS.cache, this.data);
-    },
+  const STOP = new Set(('a an the and or but if of to in on at by for from with about as into onto over under after before than then so such ' +
+    'that this these those there here it its is are was were be been being am do does did doing have has had having will would shall should ' +
+    'can could may might must i me my mine we us our you your he him his she her they them their what which who whom whose when where why how ' +
+    'all any each both few more most other some just very really also only own same too up down out off again once via amp says said ' +
+    'according report reports reported breaking update lol omg guys anyone').split(' '));
+  const NEG = new Set(['not', 'no', 'never', 'none', 'nor', 'without', 'cannot', 'nobody', 'nothing', 'neither']);
+  const isNumTok = (w) => /\d/.test(w);
+  const stem = (w) => (w.length > 4 ? w.replace(/ies$/, 'y').replace(/(ing|ed)$/, '') : w).replace(/([^s])s$/, '$1');
+
+  // Normalised bag of words. Numbers keep their value ("380,000" -> "380000", "1.5%"), contractions
+  // become explicit negations ("didn't" -> "did not") so they can be guarded.
+  function tokenize(text, cap = 48) {
+    const out = new Set();
+    const s = String(text || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/(\d)[,\u00a0](?=\d{3}\b)/g, '$1')
+      .replace(/n['’]t\b/g, ' not')
+      .replace(/['’](s|re|ve|ll|d|m)\b/g, '');
+    for (let w of s.split(/[^a-z0-9.%]+/)) {
+      w = w.replace(/^\.+|\.+$/g, '');
+      if (!w || STOP.has(w)) continue;
+      if (!isNumTok(w)) { if (w.length < 2) continue; w = stem(w); }
+      out.add(w);
+      if (out.size >= cap) break;
+    }
+    return out;
+  }
+  const postTokens = (p) => tokenize(`${p.title || ''} ${String(p.body || '').slice(0, 600)}`);
+
+  // Jaccard similarity with guards: numbers and negation must agree, and very short
+  // texts only match exactly - "inflation fell to 1%" must never match "... 3%".
+  function similarity(a, b) {
+    if (!a || !b || !a.size || !b.size) return 0;
+    let inter = 0;
+    for (const x of a) if (b.has(x)) inter++;
+    const j = inter / (a.size + b.size - inter);
+    if (j === 1) return 1;
+    if (Math.min(a.size, b.size) < 4) return 0;
+    for (const x of a) if (isNumTok(x) && !b.has(x)) return 0;
+    for (const x of b) if (isNumTok(x) && !a.has(x)) return 0;
+    const negA = [...a].some((x) => NEG.has(x)), negB = [...b].some((x) => NEG.has(x));
+    return negA === negB ? j : 0;
+  }
+
+  // Canonical form of a linked URL (drops tracking params, www/m./amp, youtu.be, trailing slash).
+  function urlKey(u) {
+    const s = safeUrl(u);
+    if (!s) return '';
+    const x = new URL(s);
+    let host = x.hostname.toLowerCase().replace(/^(www|m|mobile|amp)\./, '');
+    if (/(^|\.)(reddit\.com|redd\.it|redditmedia\.com)$/.test(host)) return '';
+    if (host === 'youtu.be') { x.searchParams.set('v', x.pathname.slice(1)); x.pathname = '/watch'; host = 'youtube.com'; }
+    for (const k of [...x.searchParams.keys()]) if (/^(utm_|fbclid|gclid|igshid|mc_|cmp|ref|ref_src|share|si$|s$|source|feature|smid|taid)/i.test(k)) x.searchParams.delete(k);
+    x.searchParams.sort();
+    const path = x.pathname.replace(/\/amp\/?$/i, '').replace(/\/+$/, '');
+    const q = x.searchParams.toString();
+    return host + path + (q ? `?${q}` : '');
+  }
+
+  const dupThreshold = () => clampNum(settings.dupThreshold, 50, 100, 80) / 100;
+
+  // ---------------------------------------------------------------------------
+  // Research log: every analysed post, persisted locally (one storage key per post
+  // + a compact index used for duplicate matching, the History tab and CSV export)
+  // ---------------------------------------------------------------------------
+  const Log = {
+    idx: null,            // Map id -> meta
     deleted: new Set(),
     saveSoon: null,
-    clear() { this.data = {}; this.deleted.clear(); GM_setValue(KEYS.cache, {}); },
+
+    ttl() { return Math.max(0.1, Number(settings.logDays) || 30) * 864e5; },
+    max() { return Math.max(100, parseInt(settings.maxLogEntries, 10) || 5000); },
+
+    decode(raw) {
+      const m = new Map();
+      if (raw && typeof raw === 'object') {
+        for (const [id, a] of Object.entries(raw)) {
+          if (Array.isArray(a)) m.set(id, { t: a[0], kind: a[1], risk: a[2], title: a[3] || '', sub: a[4] || '', tt: a[5] || '', ct: a[6] || '', url: a[7] || '', dup: a[8] || '', sat: a[9] || 0 });
+        }
+      }
+      return m;
+    },
+    encode() {
+      const o = {};
+      for (const [id, m] of this.idx) o[id] = [m.t, m.kind, m.risk, m.title, m.sub, m.tt, m.ct, m.url, m.dup, m.sat];
+      return o;
+    },
+    set(m, key) { // lazily materialised token sets
+      const k = `_${key}`;
+      if (!m[k]) m[k] = new Set(m[key] ? m[key].split(' ') : []);
+      return m[k];
+    },
+
+    load() {
+      if (this.idx) return this;
+      this.idx = this.decode(GM_getValue(KEYS.index, {}));
+      this.migrateLegacy();
+      this.reconcile();
+      this.prune();
+      return this;
+    },
+
+    // Self-heal: records whose index entry was never written (tab closed mid-save, other tabs).
+    reconcile() {
+      let keys;
+      try { keys = GM_listValues(); } catch (_) { return; }
+      let added = 0;
+      for (const k of keys) {
+        if (!k.startsWith(KEYS.logPrefix)) continue;
+        const id = k.slice(KEYS.logPrefix.length);
+        if (this.idx.has(id)) continue;
+        const rec = GM_getValue(k, null);
+        if (rec && rec.r) { this.idx.set(id, this.meta(rec.r, rec.t)); added++; }
+      }
+      if (added) { log('reconciled', added, 'log entries'); this.saveIdx(); }
+    },
+
+    flush() { if (this.dirty) { this.dirty = false; this.saveIdx(); } },
+
+    // v1.0 kept a single 24h blob under 'rta.cache' - fold it into the log once.
+    migrateLegacy() {
+      const old = GM_getValue(KEYS.legacyCache, null);
+      if (!old || typeof old !== 'object') return;
+      for (const [id, e] of Object.entries(old)) {
+        if (e && e.r && !this.idx.has(id)) {
+          GM_setValue(KEYS.logPrefix + id, { t: e.t, r: e.r });
+          this.idx.set(id, this.meta(e.r, e.t, e.r.post));
+        }
+      }
+      try { GM_deleteValue(KEYS.legacyCache); } catch (_) { GM_setValue(KEYS.legacyCache, null); }
+      this.saveIdx();
+    },
+
+    meta(r, t, post) {
+      const p = post || r.post || {};
+      return {
+        t,
+        kind: r.kind === 'audit' ? 'a' : 's',
+        risk: r.kind === 'audit' ? r.risk : -1,
+        sat: r.kind === 'audit' ? r.sarcasm : 0,
+        title: truncate(String(p.title || ''), 160),
+        sub: p.subreddit || '',
+        tt: [...postTokens(p)].join(' '),
+        ct: r.claim ? [...tokenize(r.claim)].join(' ') : '',
+        url: urlKey(p.url),
+        dup: (r.dupOf && r.dupOf.id) || '',
+      };
+    },
+
+    get(id) {
+      this.load();
+      const rec = GM_getValue(KEYS.logPrefix + id, null);
+      if (!rec || !rec.r) {
+        if (this.idx.has(id)) { this.idx.delete(id); this.saveSoon(); }
+        return null;
+      }
+      if (Date.now() - rec.t > this.ttl()) { this.remove(id); return null; }
+      if (!this.idx.has(id)) { this.idx.set(id, this.meta(rec.r, rec.t)); this.saveSoon(); } // written by another tab
+      return rec.r;
+    },
+
+    put(id, r, post) {
+      this.load();
+      const t = Date.now();
+      GM_setValue(KEYS.logPrefix + id, { t, r });
+      this.idx.set(id, this.meta(r, t, post));
+      this.deleted.delete(id);
+      if (this.idx.size > this.max() + 50) this.prune();
+      this.saveSoon();
+      UI.historyChanged();
+    },
+
+    remove(id) {
+      this.load();
+      try { GM_deleteValue(KEYS.logPrefix + id); } catch (_) { GM_setValue(KEYS.logPrefix + id, null); }
+      this.idx.delete(id);
+      this.deleted.add(id);
+      this.saveSoon();
+      UI.historyChanged();
+    },
+
+    prune() {
+      const now = Date.now(), ttl = this.ttl(), max = this.max();
+      const sorted = [...this.idx.entries()].sort((a, b) => b[1].t - a[1].t);
+      let changed = false;
+      sorted.forEach(([id, m], i) => {
+        if (i >= max || now - m.t > ttl) {
+          try { GM_deleteValue(KEYS.logPrefix + id); } catch (_) { /* ignore */ }
+          this.idx.delete(id);
+          this.deleted.add(id);
+          changed = true;
+        }
+      });
+      if (changed) this.saveSoon();
+    },
+
+    // Merge with whatever other tabs wrote meanwhile (newest entry wins), then persist the index.
+    saveIdx() {
+      const stored = this.decode(GM_getValue(KEYS.index, {}));
+      for (const [id, m] of stored) {
+        if (this.deleted.has(id)) continue;
+        const cur = this.idx.get(id);
+        if (!cur || cur.t < m.t) this.idx.set(id, m);
+      }
+      this.deleted.clear();
+      this.dirty = false;
+      GM_setValue(KEYS.index, this.encode());
+    },
+
+    clear() {
+      this.load();
+      let keys = [];
+      try { keys = GM_listValues().filter((k) => k.startsWith(KEYS.logPrefix)); } catch (_) { keys = [...this.idx.keys()].map((id) => KEYS.logPrefix + id); }
+      for (const k of keys) { try { GM_deleteValue(k); } catch (_) { GM_setValue(k, null); } }
+      this.idx = new Map();
+      this.deleted.clear();
+      GM_setValue(KEYS.index, {});
+      UI.historyChanged();
+    },
+
+    size() { return this.load().idx.size; },
+
+    entries() { return [...this.load().idx.entries()].sort((a, b) => b[1].t - a[1].t); },
+
+    // Tier 1 - free: crosspost of / same link as / near-identical text to a logged post.
+    findSimilarPost(post) {
+      this.load();
+      if (post.crosspostParent && post.crosspostParent !== post.id && this.idx.has(post.crosspostParent)) {
+        return { id: post.crosspostParent, via: 'crosspost', sim: 1 };
+      }
+      const thr = dupThreshold();
+      const tt = postTokens(post), uk = urlKey(post.url);
+      let best = null;
+      for (const [id, m] of this.idx) {
+        if (id === post.id) continue;
+        const sim = similarity(tt, this.set(m, 'tt'));
+        let via = null;
+        if (uk && m.url === uk && sim >= Math.min(0.5, thr)) via = 'link';
+        else if (sim >= thr) via = 'text';
+        if (via && (!best || sim > best.sim)) best = { id, via, sim };
+      }
+      return best;
+    },
+
+    // Tier 2 - after claim extraction: lexically equivalent claim already audited.
+    findSimilarClaim(claim, selfId) {
+      const ct = tokenize(claim);
+      const thr = dupThreshold();
+      let best = null;
+      for (const [id, m] of this.load().idx) {
+        if (id === selfId || m.kind !== 'a' || !m.ct) continue;
+        const sim = similarity(ct, this.set(m, 'ct'));
+        if (sim >= thr && (!best || sim > best.sim)) best = { id, via: 'claim', sim };
+      }
+      return best;
+    },
+
+    // Loosely related audited claims, offered to the extraction model for a semantic "same claim?" judgement.
+    claimCandidates(post, n = 5) {
+      const tt = postTokens(post);
+      if (tt.size < 3) return [];
+      const scored = [];
+      for (const [id, m] of this.load().idx) {
+        if (id === post.id || m.kind !== 'a' || !m.ct || m.dup) continue;
+        const a = this.set(m, 'tt'), c = this.set(m, 'ct');
+        let i1 = 0, i2 = 0;
+        for (const x of tt) { if (a.has(x)) i1++; if (c.has(x)) i2++; }
+        const score = Math.max(i1 / (tt.size + a.size - i1), i2 / Math.min(tt.size, c.size || 1));
+        if (score >= 0.25) scored.push({ id, score });
+      }
+      return scored.sort((x, y) => y.score - x.score).slice(0, n)
+        .map(({ id }) => { const r = this.get(id); return r && r.kind === 'audit' && r.claim ? { id, claim: r.claim } : null; })
+        .filter(Boolean);
+    },
   };
-  Cache.saveSoon = debounce(() => Cache.save(), 600);
+  // Throttled (not debounced) so a steady stream of results still gets persisted; flushed on page hide.
+  const saveIdxThrottled = throttle(() => Log.flush(), 1000);
+  Log.saveSoon = () => { Log.dirty = true; saveIdxThrottled(); };
+  window.addEventListener('pagehide', () => Log.flush());
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') Log.flush(); });
+
+  // A copy of an earlier verdict, attributed to the post it came from.
+  function reuseResult(origId, orig, post, via, sim) {
+    const root = orig.dupOf || { id: origId, title: orig.post && orig.post.title, sub: orig.post && orig.post.subreddit, permalink: orig.post && orig.post.permalink, at: orig.at };
+    return Object.assign({}, orig, {
+      post: slimPost(post),
+      dupOf: { id: root.id, title: root.title, sub: root.sub, permalink: root.permalink, at: root.at, via, sim: sim == null ? null : Math.round(sim * 100) },
+    });
+  }
+
+  // Lifetime savings counters (shown in the History tab).
+  function getStats() {
+    const s = GM_getValue(KEYS.stats, null);
+    return Object.assign({ revisits: 0, dupHits: 0, claimHits: 0, savedUsd: 0, savedSearches: 0, fullChecks: 0, fullUsd: 0, extractChecks: 0, extractUsd: 0 }, s && typeof s === 'object' ? s : {});
+  }
+  function addStats(delta) {
+    const st = getStats();
+    for (const [k, v] of Object.entries(delta)) st[k] = (st[k] || 0) + v;
+    GM_setValue(KEYS.stats, st);
+    return st;
+  }
+  function recordSaving(kind) {
+    const st = getStats();
+    const avgFull = st.fullChecks ? st.fullUsd / st.fullChecks : 0.0005;
+    const avgExtract = st.extractChecks ? st.extractUsd / st.extractChecks : 0.0001;
+    if (kind === 'claim') addStats({ claimHits: 1, savedUsd: Math.max(0, avgFull - avgExtract), savedSearches: settings.tavilyKey ? 1 : 0 });
+    else addStats({ [kind === 'revisit' ? 'revisits' : 'dupHits']: 1, savedUsd: avgFull, savedSearches: settings.tavilyKey ? 1 : 0 });
+    addUsage({ reused: 1 });
+  }
 
   function getUsage() {
     const u = GM_getValue(KEYS.usage, null);
@@ -369,6 +663,7 @@
       domain: j.domain || dom.domain,
       permalink: j.permalink || dom.permalink,
       author: j.author || dom.author,
+      crosspostParent: normId(j.crosspost_parent) || (Array.isArray(j.crosspost_parent_list) && j.crosspost_parent_list[0] && normId(j.crosspost_parent_list[0].name)) || null,
     });
   }
 
@@ -404,7 +699,7 @@
     throw new Error('Could not parse the model\'s JSON output');
   }
 
-  async function llmJson(messages, cfg = settings) {
+  async function llmJson(messages, cfg = settings, meter = null) {
     const base = String(cfg.baseUrl || DEFAULTS.baseUrl).trim().replace(/\/+$/, '');
     const body = { model: cfg.model || DEFAULTS.model, temperature: 0, response_format: { type: 'json_object' }, messages };
     for (let attempt = 0; ; attempt++) {
@@ -421,6 +716,7 @@
         const u = j.usage || {};
         const cost = ((u.prompt_tokens || 0) * (Number(cfg.priceInPerM) || 0) + (u.completion_tokens || 0) * (Number(cfg.priceOutPerM) || 0)) / 1e6;
         addUsage({ usd: cost, llmCalls: 1 });
+        if (meter) meter.usd += cost;
         const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
         return parseJsonLoose(content);
       }
@@ -472,7 +768,12 @@
     return `Subreddit: r/${p.subreddit || 'unknown'}\nFlair: ${p.flair || 'None'}\nLinked URL: ${p.url || 'none'}\n<post>\nTitle: ${p.title}\nBody: ${body || '(no body text)'}\n</post>`;
   }
 
-  function buildExtractMessages(p) {
+  function buildExtractMessages(p, candidates) {
+    const prior = candidates && candidates.length
+      ? `\n\nPreviously fact-checked claims:\n${candidates.map((c, i) => `[C${i + 1}] ${truncate(c.claim, 300)}`).join('\n')}\n` +
+        'If - and only if - this post asserts materially the SAME claim as one of them (same subject, same numbers, same direction/meaning; ' +
+        'rewording is fine), set "same_as" to its label (e.g. "C1"). Otherwise set "same_as" to null. When in doubt, use null.'
+      : '';
     return [
       { role: 'system', content: SYSTEM },
       {
@@ -482,10 +783,10 @@
 "Not verifiable" = pure opinion, questions, requests for help, personal anecdotes with nothing checkable, memes/art/jokes with no factual assertion.
 For link posts the title is usually the headline - treat it as the claim if it asserts something.
 
-${postBlock(p, 1500)}
+${postBlock(p, 1500)}${prior}
 
 Return ONLY JSON:
-{"is_verifiable": boolean, "content_type": "news|politics|science/health|finance|personal|opinion|meme/satire|question|other", "summary": "one-sentence plain-language summary of the post", "claim": "the single most important checkable claim, stated neutrally (empty if none)", "query": "an optimised web search query to verify the claim"}`,
+{"is_verifiable": boolean, "content_type": "news|politics|science/health|finance|personal|opinion|meme/satire|question|other", "summary": "one-sentence plain-language summary of the post", "claim": "the single most important checkable claim, stated neutrally (empty if none)", "query": "an optimised web search query to verify the claim"${prior ? ', "same_as": "C1|C2|...|null"' : ''}}`,
       },
     ];
   }
@@ -606,6 +907,30 @@ Return ONLY JSON:
     UI.updateStatus();
   }
 
+  // Show a result that came from the research log (exact revisit or duplicate) - no tokens spent.
+  function showLogged(id, el, post, r, reused) {
+    const job = newJob(id, el, Object.assign({}, post, r.post || {}));
+    job.fromCache = true;
+    job.reused = !!reused;
+    updateJob(job, { state: r.kind === 'skip' ? 'skipped' : 'done', result: r });
+    UI.markOnScreen(job.id, Scanner.visible.has(el));
+    maybeAnnounce(job);
+    return job;
+  }
+
+  // Tier 1: crosspost / same link / near-identical text already in the log.
+  function reuseDuplicatePost(post) {
+    if (!settings.dedupe) return null;
+    const m = Log.findSimilarPost(post);
+    const orig = m && Log.get(m.id);
+    if (!orig) return null;
+    const r = reuseResult(m.id, orig, post, m.via, m.sim);
+    Log.put(post.id, r, post);
+    recordSaving('dup');
+    log('reused', post.id, 'from', m.id, m.via, m.sim);
+    return r;
+  }
+
   function onDwell(el, adapter) {
     if (!el.isConnected) return;
     const dom = adapter.read(el);
@@ -620,15 +945,14 @@ Return ONLY JSON:
     }
     if (!subAllowed(dom.subreddit)) return;
 
-    const cached = Cache.get(dom.id);
-    if (cached) {
-      job = newJob(dom.id, el, Object.assign({}, dom, cached.post || {}));
-      job.fromCache = true;
-      updateJob(job, { state: cached.kind === 'skip' ? 'skipped' : 'done', result: cached });
-      UI.markOnScreen(job.id, true);
-      maybeAnnounce(job);
-      return;
-    }
+    // Already researched this exact post (any tab, any earlier session)?
+    const logged = Log.get(dom.id);
+    if (logged) { recordSaving('revisit'); showLogged(dom.id, el, dom, logged, !!logged.dupOf); return; }
+
+    // A repost / near-duplicate of something already researched? (uses on-page text; re-checked with full text later)
+    const dupR = reuseDuplicatePost(dom);
+    if (dupR) { showLogged(dom.id, el, dom, dupR, true); return; }
+
     if (!settings.apiKey) { UI.showBanners(); return; }
     if (settings.paused || halted) return;
 
@@ -638,6 +962,18 @@ Return ONLY JSON:
     UI.markOnScreen(job.id, true);
     if (settings.autoOpen === 'always') UI.open('activity');
     pump();
+  }
+
+  // A near-identical post that is being researched right now (e.g. two crossposts on screen together).
+  function findInflightTwin(job) {
+    const tt = postTokens(job.post), uk = urlKey(job.post.url), thr = dupThreshold();
+    for (const other of jobs.values()) {
+      if (other === job || other.state !== 'running' || !other.fp) continue;
+      if (job.post.crosspostParent === other.id || other.post.crosspostParent === job.id) return other;
+      const sim = similarity(tt, other.fp.tt);
+      if (sim >= thr || (uk && uk === other.fp.url && sim >= Math.min(0.5, thr))) return other;
+    }
+    return null;
   }
 
   function pump() {
@@ -662,21 +998,62 @@ Return ONLY JSON:
   }
 
   async function runJob(job) {
+    const meter = { usd: 0 };
+    let release;
+    job.done = new Promise((res) => { release = res; });
+    const force = !!job.force;
+    job.force = false;
     try {
-      updateJob(job, { state: 'running', stage: 'extract', error: null });
+      updateJob(job, { state: 'running', stage: 'extract', error: null, reused: false, fromCache: false });
       job.post = mergePost(job.post, await Enricher.get(job.id));
+      job.post.id = job.id;
       if (!subAllowed(job.post.subreddit)) { removeJob(job); return; }
 
-      // 1. Claim extraction (finalrun.py: extract_prompt)
-      const ext = await llmJson(buildExtractMessages(job.post));
+      if (settings.dedupe && !force) {
+        // If an equivalent post is mid-check, wait for it instead of paying twice.
+        const twin = findInflightTwin(job);
+        if (twin) {
+          updateJob(job, { stage: 'wait' });
+          await twin.done;
+          updateJob(job, { stage: 'extract' });
+        }
+        // Full post text (and crosspost parent) is known now - look for a duplicate again.
+        const dupR = reuseDuplicatePost(job.post);
+        if (dupR) { updateJob(job, { state: dupR.kind === 'skip' ? 'skipped' : 'done', stage: null, result: dupR, reused: true }); maybeAnnounce(job); return; }
+      }
+      job.fp = { tt: postTokens(job.post), url: urlKey(job.post.url) }; // lets later twins find this job
+
+      // 1. Claim extraction (finalrun.py: extract_prompt) + semantic "already checked?" judgement
+      const candidates = settings.dedupe && !force ? Log.claimCandidates(job.post) : [];
+      const ext = await llmJson(buildExtractMessages(job.post, candidates), settings, meter);
+      addStats({ extractChecks: 1, extractUsd: meter.usd });
       ext.claim = str(ext.claim);
       const verifiable = ext.is_verifiable === true || ext.is_verifiable === 'true';
       if (!verifiable || !ext.claim) {
         const r = { kind: 'skip', contentType: str(ext.content_type), summary: str(ext.summary), at: Date.now(), post: slimPost(job.post) };
-        Cache.put(job.id, r);
+        Log.put(job.id, r, job.post);
         addUsage({ checks: 1 });
         updateJob(job, { state: 'skipped', stage: null, result: r });
         return;
+      }
+
+      // Tier 2: same claim already audited (model-judged first, then lexical) -> skip research + audit.
+      if (settings.dedupe && !force) {
+        let match = null;
+        const lab = /^C(\d+)$/i.exec(str(ext.same_as));
+        const cand = lab && candidates[Number(lab[1]) - 1];
+        if (cand) match = { id: cand.id, via: 'semantic', sim: null };
+        if (!match) match = Log.findSimilarClaim(ext.claim, job.id);
+        const orig = match && Log.get(match.id);
+        if (orig && orig.kind === 'audit') {
+          const r = reuseResult(match.id, orig, job.post, match.via, match.sim);
+          Log.put(job.id, r, job.post);
+          recordSaving('claim');
+          addUsage({ checks: 1 });
+          updateJob(job, { state: 'done', stage: null, result: r, reused: true });
+          maybeAnnounce(job);
+          return;
+        }
       }
 
       // 2. Web research (finalrun.py: GPT-Researcher -> Tavily search API)
@@ -690,9 +1067,10 @@ Return ONLY JSON:
 
       // 3. Audit (finalrun.py: audit_prompt)
       updateJob(job, { stage: 'audit' });
-      const audit = await llmJson(buildAuditMessages(job.post, ext, research));
+      const audit = await llmJson(buildAuditMessages(job.post, ext, research), settings, meter);
       const r = normaliseAudit(audit, ext, research, job.post);
-      Cache.put(job.id, r);
+      Log.put(job.id, r, job.post);
+      addStats({ fullChecks: 1, fullUsd: meter.usd });
       addUsage({ checks: 1 });
       updateJob(job, { state: 'done', stage: null, result: r });
       maybeAnnounce(job);
@@ -705,14 +1083,20 @@ Return ONLY JSON:
         UI.showBanners();
         UI.open('error');
       }
+    } finally {
+      job.fp = null;
+      release();
     }
   }
 
-  function recheck(job) {
-    Cache.remove(job.id);
+  // Re-run a post from scratch. force=true also bypasses duplicate matching ("Check anyway").
+  function recheck(job, force = true) {
+    Log.remove(job.id);
     announced.delete(job.id);
     if (!settings.apiKey) { UI.showBanners(); return; }
-    updateJob(job, { state: 'queued', stage: null, result: null, error: null, fromCache: false });
+    if (!jobs.has(job.id)) jobs.set(job.id, job);
+    job.force = force;
+    updateJob(job, { state: 'queued', stage: null, result: null, error: null, fromCache: false, reused: false });
     queue.push(job);
     pump();
   }
@@ -948,13 +1332,29 @@ button{font:inherit;color:inherit}
 .live-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
 .live-dot.on{background:var(--ok);box-shadow:0 0 0 0 rgba(61,220,151,.6);animation:rta-ping 1.6s infinite}
 .live-dot.paused{background:var(--warn)}
-.tabs{position:relative;display:grid;grid-template-columns:1fr 1fr;margin-top:14px;padding:3px;border-radius:11px;background:rgba(0,0,0,.25);border:1px solid var(--line)}
+.tabs{position:relative;display:grid;grid-template-columns:1fr 1fr 1fr;margin-top:14px;padding:3px;border-radius:11px;background:rgba(0,0,0,.25);border:1px solid var(--line)}
 .tab{all:unset;position:relative;z-index:1;text-align:center;padding:6px 0;font-size:12px;font-weight:600;color:var(--muted);cursor:pointer;border-radius:8px;transition:color .25s}
 .tab.active{color:#fff}
 .tab .n{display:inline-block;min-width:18px;margin-left:6px;padding:0 5px;border-radius:9px;background:rgba(255,255,255,.08);font-size:11px}
 .tab.flag .n.hot{background:var(--bad);color:#fff}
-.tab-ind{position:absolute;top:3px;bottom:3px;left:3px;width:calc(50% - 3px);border-radius:8px;background:rgba(255,255,255,.09);box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);transition:transform .4s cubic-bezier(.16,1,.3,1)}
+.tab-ind{position:absolute;top:3px;bottom:3px;left:3px;width:calc((100% - 6px) / 3);border-radius:8px;background:rgba(255,255,255,.09);box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);transition:transform .4s cubic-bezier(.16,1,.3,1)}
 .tabs[data-tab=flagged] .tab-ind{transform:translateX(100%)}
+.tabs[data-tab=history] .tab-ind{transform:translateX(200%)}
+.history{display:none}
+.scroll[data-tab=history] .history{display:block}
+.scroll[data-tab=history] .list,.scroll[data-tab=history] .empty{display:none !important}
+.h-stats{margin:0 12px 10px;padding:12px 14px;border-radius:14px;background:linear-gradient(135deg,rgba(124,156,255,.12),rgba(176,132,255,.06));border:1px solid rgba(124,156,255,.25);display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+.h-stats b{display:block;font-size:17px;font-weight:800;color:#fff;letter-spacing:-.01em}
+.h-stats span{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+.h-tools{display:flex;gap:8px;align-items:center;margin:0 12px 10px}
+.h-tools .inp{flex:1}
+.h-tools select.inp{flex:none;width:auto}
+.h-more{display:flex;justify-content:center;margin:4px 0 10px}
+.h-note{margin:0 16px 12px;font-size:11px;color:var(--muted)}
+.reuse{margin-top:8px;padding:7px 9px;border-radius:9px;background:rgba(124,156,255,.08);border:1px solid rgba(124,156,255,.22);font-size:11.5px;color:#c9d5ff;display:flex;gap:7px;align-items:flex-start;overflow-wrap:anywhere}
+.reuse svg{flex:none;margin-top:2px}
+.reuse a{color:#dfe6ff}
+.tag.dup{background:rgba(124,156,255,.2);color:#c9d5ff}
 
 .views{position:relative;flex:1;min-height:0;display:flex;width:200%;transition:transform .55s cubic-bezier(.16,1,.3,1)}
 .views.settings{transform:translateX(-50%)}
@@ -1073,6 +1473,7 @@ select.inp option{background:#1b2030;color:#fff}
 .range-val{font-size:20px;font-weight:800;color:#fff}
 .range-desc{font-size:11px;color:var(--muted);text-align:right}
 input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
+input[type=range].neutral{accent-color:var(--accent)}
 .test-out{font-size:11.5px;margin-top:6px;min-height:1em}
 .test-out.ok{color:var(--ok)}
 .test-out.bad{color:var(--bad)}
@@ -1115,10 +1516,12 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       this.pauseBtn = h('button', { class: 'btn-icon', type: 'button', onclick: () => this.togglePause() });
       this.nLive = h('span', { class: 'n' }, '0');
       this.nFlag = h('span', { class: 'n' }, '0');
+      this.nHist = h('span', { class: 'n' }, '0');
       this.tabs = h('div', { class: 'tabs', 'data-tab': 'live', role: 'tablist' },
         h('span', { class: 'tab-ind' }),
-        h('button', { class: 'tab live active', type: 'button', role: 'tab', onclick: () => this.setTab('live') }, 'Live feed', this.nLive),
-        h('button', { class: 'tab flag', type: 'button', role: 'tab', onclick: () => this.setTab('flagged') }, 'Flagged', this.nFlag));
+        h('button', { class: 'tab live active', type: 'button', role: 'tab', onclick: () => this.setTab('live') }, 'Live', this.nLive),
+        h('button', { class: 'tab flag', type: 'button', role: 'tab', onclick: () => this.setTab('flagged') }, 'Flagged', this.nFlag),
+        h('button', { class: 'tab hist', type: 'button', role: 'tab', title: 'Everything researched so far (local log)', onclick: () => this.setTab('history') }, 'History', this.nHist));
       const head = h('div', { class: 'head' },
         h('div', { class: 'head-row' },
           h('div', { class: 'brand' }, icon('shield', 18)),
@@ -1132,12 +1535,13 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       this.banners = h('div', { class: 'banners' });
       this.empty = h('div', { class: 'empty' });
       this.list = h('div', { class: 'list', 'data-filter': 'live' });
+      this.history = h('div', { class: 'history' });
       this.usageEl = h('div', { class: 'usage' });
       const listView = h('div', { class: 'view' },
-        (this.listScroll = h('div', { class: 'scroll' }, this.banners, this.list, this.empty)),
+        (this.listScroll = h('div', { class: 'scroll', 'data-tab': 'live' }, this.banners, this.list, this.empty, this.history)),
         h('div', { class: 'foot' }, this.usageEl,
-          h('button', { class: 'btn-icon', type: 'button', title: 'Export cached results as CSV', 'aria-label': 'Export CSV', onclick: () => exportCsv() }, icon('download', 16)),
-          h('button', { class: 'btn-icon', type: 'button', title: 'Clear the list (cached results are kept)', 'aria-label': 'Clear list', onclick: () => this.clearList() }, icon('trash', 16))));
+          h('button', { class: 'btn-icon', type: 'button', title: 'Export the research log as CSV', 'aria-label': 'Export CSV', onclick: () => exportCsv() }, icon('download', 16)),
+          h('button', { class: 'btn-icon', type: 'button', title: 'Clear the live list (the research log is kept)', 'aria-label': 'Clear list', onclick: () => this.clearList() }, icon('trash', 16))));
 
       // Settings view
       this.settingsView = h('div', { class: 'view' });
@@ -1204,11 +1608,75 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
     setTab(tab) {
       this.tab = tab;
       this.tabs.setAttribute('data-tab', tab);
+      this.listScroll.setAttribute('data-tab', tab);
       this.tabs.querySelector('.tab.live').classList.toggle('active', tab === 'live');
       this.tabs.querySelector('.tab.flag').classList.toggle('active', tab === 'flagged');
-      this.list.setAttribute('data-filter', tab);
+      this.tabs.querySelector('.tab.hist').classList.toggle('active', tab === 'history');
+      if (tab !== 'history') this.list.setAttribute('data-filter', tab);
+      else this.renderHistory(true);
       this.views.classList.remove('settings');
       this.updateEmpty();
+    },
+
+    // ---- history (research log) ----
+    historyChanged() {
+      if (!this.nHist) return;
+      this.nHist.textContent = String(Log.size());
+      if (this.tab === 'history' && this.isOpen) this.renderHistorySoon();
+    },
+    renderHistorySoon: null,
+
+    renderHistory(reset) {
+      if (reset || !this.histUi) {
+        this.histLimit = 40;
+        const search = h('input', { class: 'inp', type: 'search', placeholder: 'Search title or subreddit…', 'aria-label': 'Search history' });
+        const filter = h('select', { class: 'inp', 'aria-label': 'Filter history' },
+          h('option', { value: 'all' }, 'All'),
+          h('option', { value: 'flagged' }, 'Risky'),
+          h('option', { value: 'dup' }, 'Reused'),
+          h('option', { value: 'skip' }, 'No claim'));
+        if (this.histUi) { search.value = this.histUi.search.value; filter.value = this.histUi.filter.value; }
+        search.addEventListener('input', debounce(() => { this.histLimit = 40; this.renderHistoryList(); }, 200));
+        filter.addEventListener('change', () => { this.histLimit = 40; this.renderHistoryList(); });
+        this.histUi = { search, filter, stats: h('div', { class: 'h-stats' }), list: h('div', { class: 'h-list' }), more: h('div', { class: 'h-more' }) };
+        this.history.replaceChildren(this.histUi.stats, h('div', { class: 'h-tools' }, search, filter), this.histUi.list, this.histUi.more,
+          h('div', { class: 'h-note' }, `Kept for ${settings.logDays} days in your userscript manager's local storage. Posts in the log are never re-analysed; reposts and same-claim posts reuse the earlier verdict.`));
+      }
+      const st = getStats();
+      const stat = (v, l) => h('div', {}, h('b', {}, v), h('span', {}, l));
+      this.histUi.stats.replaceChildren(
+        stat(Log.size().toLocaleString(), 'posts logged'),
+        stat((st.dupHits + st.claimHits + st.revisits).toLocaleString(), 'repeats skipped'),
+        stat(`$${st.savedUsd.toFixed(st.savedUsd < 1 ? 3 : 2)}`, 'est. saved'));
+      this.renderHistoryList();
+    },
+
+    renderHistoryList() {
+      const ui = this.histUi;
+      const q = ui.search.value.trim().toLowerCase();
+      const f = ui.filter.value;
+      const thr = Number(settings.riskThreshold);
+      const rows = Log.entries().filter(([, m]) => {
+        if (q && !`${m.title} r/${m.sub}`.toLowerCase().includes(q)) return false;
+        if (f === 'flagged') return m.kind === 'a' && m.risk >= thr && !(settings.ignoreSatire && m.sat >= (Number(settings.satireCutoff) || 7));
+        if (f === 'dup') return !!m.dup;
+        if (f === 'skip') return m.kind === 's';
+        return true;
+      });
+      const cards = [];
+      for (const [id, m] of rows.slice(0, this.histLimit)) {
+        const r = Log.get(id);
+        if (!r) continue;
+        const live = jobs.get(id);
+        const pseudo = { id, el: live && live.el, post: r.post || {}, state: r.kind === 'skip' ? 'skipped' : 'done', result: r, fromCache: true, reused: !!r.dupOf, history: true, loggedAt: m.t };
+        const card = h('div', { class: ['card', pseudo.state, isFlagged(pseudo) ? 'flagged' : ''].filter(Boolean).join(' '), 'data-hid': id }, ...this.cardContent(pseudo));
+        cards.push(card);
+      }
+      ui.list.replaceChildren(...cards);
+      if (!rows.length) ui.list.replaceChildren(h('div', { class: 'empty show' }, h('div', { class: 'e-icon' }, icon('clock', 24)), h('div', {}, q || f !== 'all' ? 'No matching posts in the log.' : 'Nothing researched yet.')));
+      ui.more.replaceChildren(rows.length > this.histLimit
+        ? h('button', { class: 'btn small', type: 'button', onclick: () => { this.histLimit += 40; this.renderHistoryList(); } }, `Show more (${rows.length - this.histLimit} left)`)
+        : '');
     },
 
     togglePause() {
@@ -1242,6 +1710,7 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       this.liveDot.className = 'live-dot' + (settings.paused || halted || !settings.apiKey ? ' paused' : ' on');
       this.nLive.textContent = String(this.list.children.length);
       this.nFlag.textContent = String(flagged);
+      this.nHist.textContent = String(Log.size());
       this.nFlag.classList.toggle('hot', flagged > 0);
       this.countEl.textContent = String(flagged);
       this.countEl.classList.toggle('show', flagged > 0);
@@ -1256,7 +1725,7 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       const b = Number(settings.dailyBudgetUsd) || 0;
       this.usageEl.replaceChildren(
         h('div', {}, 'Today ', h('b', {}, `$${u.usd.toFixed(4)}`), b > 0 ? ` of $${b.toFixed(2)} cap` : ' (no cap)'),
-        h('div', {}, `${u.checks || 0} post${u.checks === 1 ? '' : 's'} checked · ${u.searches || 0} web search${u.searches === 1 ? '' : 'es'}`));
+        h('div', {}, `${u.checks || 0} checked · ${u.reused || 0} reused from log · ${u.searches || 0} search${u.searches === 1 ? '' : 'es'}`));
     },
 
     updateEmpty() {
@@ -1402,8 +1871,8 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
         const order = ['extract', 'research', 'audit'];
         const cur = order.indexOf(job.stage);
         const labels = { extract: 'Claim', research: settings.tavilyKey ? 'Research' : 'No search', audit: 'Verdict' };
-        const stageText = { extract: 'Identifying the factual claim…', research: 'Searching the web for sources…', audit: 'Weighing the evidence…' }[job.stage] || 'Working…';
-        const stageIcon = { extract: 'quote', research: 'search', audit: 'scale' }[job.stage] || 'search';
+        const stageText = { extract: 'Identifying the factual claim…', research: 'Searching the web for sources…', audit: 'Weighing the evidence…', wait: 'Same post is being checked – waiting to reuse it…' }[job.stage] || 'Working…';
+        const stageIcon = { extract: 'quote', research: 'search', audit: 'scale', wait: 'clock' }[job.stage] || 'search';
         return [h('div', { class: 'spin' }, icon(stageIcon, 15)),
           h('div', { class: 'main' }, title, this.metaRow(job), h('div', { class: 'stage' }, stageText),
             job.claim ? h('div', { class: 'claim-live' }, `“${truncate(job.claim, 160)}”`) : null,
@@ -1417,7 +1886,8 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       if (job.state === 'skipped') {
         const r = job.result || {};
         return [h('div', { class: 'skip-ico' }, icon('quote', 14)),
-          h('div', { class: 'main' }, title, this.metaRow(job, [`No checkable claim${r.contentType ? ` (${r.contentType})` : ''}`]))];
+          h('div', { class: 'main' }, title, this.metaRow(job, [`No checkable claim${r.contentType ? ` (${r.contentType})` : ''}`, job.history ? ago(job.loggedAt) : null]),
+            job.history ? h('div', { class: 'actions' }, this.forgetBtn(job)) : null)];
       }
 
       if (job.state === 'error') {
@@ -1454,7 +1924,7 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
           sec('Context', r.contextCheck),
           sources.length ? sec('Sources', h('ol', {}, sources)) : null,
           r.researchError ? sec('Web research', `Failed: ${r.researchError}`) : null,
-          sec('Checked', `${new Date(r.at).toLocaleString()} · ${r.model || ''}${job.fromCache ? ' · from cache' : ''}`)));
+          sec('Checked', `${new Date(r.at).toLocaleString()} · ${r.model || ''}${r.dupOf ? ' · reused from an earlier check' : job.fromCache ? ' · from research log' : ''}`)));
 
       const permalink = safeUrl(p.permalink);
       return [gauge,
@@ -1463,15 +1933,44 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
           this.metaRow(job, [
             flagged ? h('span', { class: 'tag flag' }, icon('alert', 11), 'Flagged') : riskLabel(r),
             isSatire(r) ? h('span', { class: 'tag sat' }, 'Satire?') : null,
+            r.dupOf ? h('span', { class: 'tag dup' }, 'Reused') : null,
             `${r.confidence} confidence`,
+            job.history ? ago(job.loggedAt) : null,
           ].filter(Boolean)),
           r.verdict ? h('div', { class: 'verdict' }, r.verdict) : null,
+          r.dupOf ? this.reuseNote(job, r.dupOf) : null,
           !r.researched ? h('div', { class: 'note' }, icon('search', 12), r.researchError ? 'Web research failed – model knowledge only' : 'Not web-verified – model knowledge only') : null,
           details,
           h('div', { class: 'actions' },
-            h('button', { class: 'btn small', type: 'button', onclick: () => this.jumpToPost(job) }, icon('target', 13), 'Show post'),
+            job.history && !(job.el && job.el.isConnected) ? null : h('button', { class: 'btn small', type: 'button', onclick: () => this.jumpToPost(job) }, icon('target', 13), 'Show post'),
             permalink ? h('a', { class: 'btn small', href: permalink, target: '_blank', rel: 'noopener' }, icon('external', 13), 'Open') : null,
-            h('button', { class: 'btn small', type: 'button', title: 'Run the check again (uses API credits)', onclick: () => recheck(job) }, icon('refresh', 13), 'Re-check')))];
+            job.history ? this.forgetBtn(job) : h('button', { class: 'btn small', type: 'button', title: 'Run the full check again (uses API credits)', onclick: () => recheck(job) }, icon('refresh', 13), 'Re-check')))];
+    },
+
+    reuseNote(job, d) {
+      const how = {
+        crosspost: 'Crosspost of a post already checked',
+        link: 'Links to the same article as a post already checked',
+        text: 'Near-identical to a post already checked',
+        claim: 'Makes the same claim as a post already checked',
+        semantic: 'Makes the same claim (judged by the model) as a post already checked',
+      }[d.via] || 'Matches a post already checked';
+      const url = safeUrl(d.permalink);
+      return h('div', { class: 'reuse' }, icon('refresh', 13), h('div', {},
+        `${how}${d.sim != null && d.sim < 100 ? ` (${d.sim}% similar)` : ''}: `,
+        url ? h('a', { href: url, target: '_blank', rel: 'noopener' }, truncate(d.title || 'original post', 90)) : truncate(d.title || 'original post', 90),
+        d.sub ? ` · r/${d.sub}` : '', d.at ? ` · ${ago(d.at)}` : '',
+        d.via === 'claim' || d.via === 'semantic' ? '. Only the quick claim check ran – web research and audit were skipped. ' : '. No tokens were spent. ',
+        job.history ? null : h('button', { class: 'btn small', type: 'button', style: { marginTop: '6px' }, title: 'Ignore the match and run a full check (uses API credits)', onclick: () => recheck(job, true) }, 'Check anyway')));
+    },
+
+    forgetBtn(job) {
+      return h('button', { class: 'btn small', type: 'button', title: 'Remove from the research log (it will be re-analysed next time it is seen)', onclick: () => {
+        Log.remove(job.id);
+        const live = jobs.get(job.id);
+        if (live && live.state !== 'running') removeJob(live);
+        this.renderHistory();
+      } }, icon('trash', 13), 'Forget');
     },
 
     clearList() {
@@ -1506,7 +2005,18 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       input('dwellMs', { type: 'number', min: 0, max: 15000, step: 100, value: s.dwellMs });
       input('maxConcurrent', { type: 'number', min: 1, max: 4, step: 1, value: s.maxConcurrent });
       input('dailyBudgetUsd', { type: 'number', min: 0, step: 0.05, value: s.dailyBudgetUsd });
-      input('cacheHours', { type: 'number', min: 0.1, step: 1, value: s.cacheHours });
+      input('logDays', { type: 'number', min: 1, max: 365, step: 1, value: s.logDays });
+      input('maxLogEntries', { type: 'number', min: 100, max: 50000, step: 100, value: s.maxLogEntries });
+      f.dupThreshold = h('input', { type: 'range', class: 'neutral', min: 50, max: 100, step: 5, value: s.dupThreshold, 'aria-label': 'Duplicate similarity' });
+      const dv = h('div', { class: 'range-val' });
+      const dd = h('div', { class: 'range-desc' });
+      const syncDup = () => {
+        const v = Number(f.dupThreshold.value);
+        dv.textContent = `${v}%`;
+        dd.textContent = v >= 100 ? 'Identical wording only' : v >= 85 ? 'Strict – minor edits only' : v >= 70 ? 'Balanced' : 'Loose – may reuse related posts';
+      };
+      f.dupThreshold.addEventListener('input', syncDup);
+      syncDup();
       input('subsAllow', { type: 'text', value: s.subsAllow, placeholder: 'e.g. canada, worldnews (blank = all)' });
       input('subsBlock', { type: 'text', value: s.subsBlock, placeholder: 'e.g. memes, aww' });
       input('priceInPerM', { type: 'number', min: 0, step: 0.01, value: s.priceInPerM });
@@ -1569,8 +2079,15 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
         h('div', { class: 'grid2' },
           field('Check after on-screen for (ms)', f.dwellMs),
           field('Parallel checks', f.maxConcurrent),
-          field('Daily spend cap (USD)', f.dailyBudgetUsd, '0 = no cap'),
-          field('Remember results (hours)', f.cacheHours)),
+          field('Daily spend cap (USD)', f.dailyBudgetUsd, '0 = no cap')),
+
+        h('div', { class: 'sec' }, 'Research log & duplicates'),
+        cb('dedupe', 'Reuse earlier verdicts for reposts & near-duplicates (crossposts, same link, near-identical text, same claim)'),
+        field('Duplicate similarity', h('div', { class: 'range-wrap' }, h('div', { class: 'range-top' }, dv, dd), f.dupThreshold),
+          'Word-overlap needed to treat two posts (or two claims) as the same. Numbers and negations must always match.'),
+        h('div', { class: 'grid2' },
+          field('Keep research log (days)', f.logDays),
+          field('Max posts in log', f.maxLogEntries)),
 
         h('div', { class: 'sec' }, 'Subreddits'),
         field('Only check these', f.subsAllow),
@@ -1586,7 +2103,11 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
               field('$ / 1M output tokens', f.priceOutPerM)),
             cb('debug', 'Log debug info to the browser console'),
             h('div', { class: 'row' },
-              h('button', { class: 'btn small danger', type: 'button', onclick: (e) => { Cache.clear(); e.currentTarget.textContent = 'Cache cleared'; } }, icon('trash', 13), 'Clear cached results'),
+              h('button', { class: 'btn small danger', type: 'button', onclick: (e) => {
+                const b = e.currentTarget;
+                if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.lastChild.textContent = `Really delete ${Log.size()} entries?`; return; }
+                Log.clear(); b.lastChild.textContent = 'Research log cleared';
+              } }, icon('trash', 13), h('span', {}, 'Clear research log')),
               s.apiKey ? h('button', { class: 'btn small danger', type: 'button', onclick: (e) => { saveSettings({ apiKey: '' }); e.currentTarget.textContent = 'Key removed'; this.showBanners(); } }, 'Remove OpenAI key') : null,
               s.tavilyKey ? h('button', { class: 'btn small danger', type: 'button', onclick: (e) => { saveSettings({ tavilyKey: '' }); e.currentTarget.textContent = 'Key removed'; this.showBanners(); } }, 'Remove Tavily key') : null),
             h('div', { class: 'hint' }, `Version ${VERSION}`))));
@@ -1611,7 +2132,10 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
         dwellMs: num('dwellMs', 0, 15000),
         maxConcurrent: Math.round(num('maxConcurrent', 1, 4)),
         dailyBudgetUsd: num('dailyBudgetUsd', 0, 1000),
-        cacheHours: num('cacheHours', 0.1, 24 * 90),
+        logDays: num('logDays', 1, 365),
+        maxLogEntries: Math.round(num('maxLogEntries', 100, 50000)),
+        dedupe: f.dedupe.checked,
+        dupThreshold: num('dupThreshold', 50, 100),
         subsAllow: f.subsAllow.value.trim(),
         subsBlock: f.subsBlock.value.trim(),
         referenceFacts: f.referenceFacts.value.trim(),
@@ -1622,6 +2146,7 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
       const k1 = f.apiKey.value.trim(); if (k1) patch.apiKey = k1;
       const k2 = f.tavilyKey.value.trim(); if (k2) patch.tavilyKey = k2;
       saveSettings(patch);
+      Log.prune();
       halted = null;
       Pills.rerenderAll();
       reevaluateAll();
@@ -1636,19 +2161,19 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
   // CSV export (same columns as finalrun.py's final_policy_audit.csv, plus extras)
   // ---------------------------------------------------------------------------
   function exportCsv() {
-    const cols = ['date', 'post_id', 'risk', 'truth_score', 'sarcasm_score', 'confidence', 'subreddit', 'title', 'claim', 'factual_check', 'context_check', 'verdict', 'sources', 'url'];
+    const cols = ['date', 'post_id', 'risk', 'truth_score', 'sarcasm_score', 'confidence', 'subreddit', 'title', 'claim', 'factual_check', 'context_check', 'verdict', 'sources', 'url', 'reused_from', 'reuse_via'];
     const cell = (v) => {
       let s = String(v == null ? '' : v);
       if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // avoid spreadsheet formula injection
       return '"' + s.replace(/"/g, '""') + '"';
     };
-    const rows = Object.entries(Cache.load())
-      .filter(([, e]) => e.r && e.r.kind === 'audit')
-      .sort((a, b) => b[1].t - a[1].t)
-      .map(([id, e]) => {
-        const r = e.r, p = r.post || {};
+    const rows = Log.entries()
+      .map(([id]) => [id, Log.get(id)])
+      .filter(([, r]) => r && r.kind === 'audit')
+      .map(([id, r]) => {
+        const p = r.post || {}, d = r.dupOf || {};
         return [new Date(r.at).toISOString(), id, r.risk, r.truth, r.sarcasm, r.confidence, p.subreddit, p.title, r.claim, r.factualCheck, r.contextCheck, r.verdict,
-          (r.sources || []).map((s) => s.url).join(' '), p.permalink ? `https://www.reddit.com${p.permalink}` : ''].map(cell).join(',');
+          (r.sources || []).map((x) => x.url).join(' '), p.permalink ? `https://www.reddit.com${p.permalink}` : '', d.id || '', d.via || ''].map(cell).join(',');
       });
     const csv = [cols.join(','), ...rows].join('\r\n');
     const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
@@ -1663,7 +2188,10 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
   // Boot
   // ---------------------------------------------------------------------------
   function boot() {
+    UI.renderHistorySoon = throttle(() => UI.renderHistory(), 800);
+    Log.load();
     UI.init();
+    UI.historyChanged();
     Scanner.start();
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('Open Truth Auditor panel', () => UI.open('menu'));
@@ -1676,6 +2204,9 @@ input[type=range]{width:100%;accent-color:var(--bad);cursor:pointer}
     }
     log('ready', VERSION);
   }
+
+  // Opt-in hook used by the automated tests (never set on real pages).
+  if (window.__RTA_TEST_HOOKS__) window.__RTA_TEST__ = { tokenize, similarity, urlKey, postTokens, Log };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
   else boot();

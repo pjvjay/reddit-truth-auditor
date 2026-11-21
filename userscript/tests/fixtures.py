@@ -58,7 +58,41 @@ for i, (sub, title) in enumerate(FILLER, start=7):
 
 # move the XSS post to the end so it is only reached by an explicit scroll
 POSTS.append(POSTS.pop(next(i for i, p in enumerate(POSTS) if p["id"] == "xss06")))
-BY_ID = {f"t3_{p['id']}": p for p in POSTS}
+
+_F = {p["id"]: p for p in POSTS}
+_fake = _F["fake01"]
+# Reposts / near-duplicates served on /r/dupes and /r/twins (not on the front page)
+DUPES = [
+    # near-identical text (punctuation / "&" / "a") -> reused before any API call
+    dict(_fake, id="fake01b", sub="news",
+         title="BREAKING: WHO confirms 5G towers spread the virus & orders a global shutdown of mobile networks!!!"),
+    # same article link (tracking params, no www, trailing slash) + reworded title -> reused
+    dict(_F["true03"], id="true03b", sub="immigration",
+         url="https://canada.ca/en/immigration-refugees-citizenship/news.html/?utm_source=reddit&utm_medium=social",
+         title="Canada's 2026 PR admissions target set at 380,000"),
+    # crosspost with an unrelated title -> reused via crosspost_parent from /by_id
+    dict(_fake, id="fake01x", sub="conspiracy", title="Crazy if true", body="", crosspost="t3_fake01"),
+    # paraphrase -> extraction model says same_as -> research + audit skipped
+    dict(_fake, id="fake01p", sub="skeptic", body="",
+         title="The World Health Organization now says 5G masts are what spread the virus",
+         claim="The World Health Organization says 5G masts spread the virus.", same_as_of="fake01"),
+    # different wording, identical extracted claim -> lexical claim match
+    dict(_fake, id="fake01c", sub="askreddit", body="",
+         title="Apparently the WHO is shutting down mobile networks worldwide because 5G spreads the virus"),
+    # same sentence but a different number -> must NOT be reused
+    dict(_F["mixed05"], id="mixed05n", title="Inflation just fell to 3%, the lowest level in 50 years",
+         claim="Inflation fell to 3%, the lowest level in 50 years.", truth=3,
+         verdict="Misleading: no major economy reported 3% as a 50-year low."),
+]
+TWINS = [
+    dict(id="twina", sub="space", type="text", title="Scientists discover liquid water in a huge underground lake on Mars",
+         body="Big if true.", verifiable=True, ctype="science/health",
+         claim="Scientists discovered liquid water in a huge underground lake on Mars.", truth=6, sarcasm=0, conf="medium",
+         fact="Radar studies suggest it but it is unconfirmed.", context="", verdict="Partly supported."),
+]
+TWINS.append(dict(TWINS[0], id="twinb", sub="science", title=TWINS[0]["title"] + "!"))
+ALL = POSTS + DUPES + TWINS
+BY_ID = {f"t3_{p['id']}": p for p in ALL}
 
 
 def permalink(p):
@@ -77,14 +111,15 @@ def by_id_json(ids):
             "url": p.get("url") or f"https://www.reddit.com{permalink(p)}",
             "domain": f"self.{p['sub']}" if p["type"] == "text" else "example.com",
             "permalink": permalink(p), "author": "someone",
+            **({"crosspost_parent": p["crosspost"]} if p.get("crosspost") else {}),
         }})
     return json.dumps({"kind": "Listing", "data": {"children": children}})
 
 
-def shreddit_page():
+def shreddit_page(posts=None):
     e = html.escape
     arts = []
-    for p in POSTS:
+    for p in (posts or POSTS):
         media = '<div class="media"></div>' if p["type"] == "link" else ""
         body = f'<div slot="text-body"><div id="t3_{p["id"]}-post-rtjson-content" class="md">{e(p["body"])}</div></div>' if p["body"] else ""
         arts.append(f'''<article aria-label="{e(p["title"])}">
@@ -138,7 +173,7 @@ ul.flat-list a{{color:#888;font-weight:bold;font-size:x-small}}
 
 
 def _find(pred):
-    for p in POSTS:
+    for p in ALL:
         if pred(p):
             return p
     return None
@@ -154,7 +189,16 @@ def llm_reply(body):
             return {"is_verifiable": False, "content_type": "other", "summary": "unknown", "claim": "", "query": ""}
         if not p["verifiable"]:
             return {"is_verifiable": False, "content_type": p["ctype"], "summary": "A user asks for hiking suggestions.", "claim": "", "query": ""}
-        return {"is_verifiable": True, "content_type": p["ctype"], "summary": p["title"], "claim": p["claim"], "query": "verify: " + p["claim"][:60]}
+        out = {"is_verifiable": True, "content_type": p["ctype"], "summary": p["title"], "claim": p["claim"], "query": "verify: " + p["claim"][:60]}
+        if "Previously fact-checked claims" in user:
+            out["same_as"] = None
+            if p.get("same_as_of"):
+                import re
+                target = next(q for q in ALL if q["id"] == p["same_as_of"])["claim"]
+                for label, text in re.findall(r"\[(C\d+)\] (.*)", user):
+                    if text.strip() == target:
+                        out["same_as"] = label
+        return out
     if "Audit this claim" in user:
         p = _find(lambda p: p.get("claim") and f"Claim: {p['claim']}\n" in user)
         if not p:

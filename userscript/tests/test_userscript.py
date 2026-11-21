@@ -36,6 +36,7 @@ GM_SHIM = r"""
   window.GM_getValue = (k, d) => (k in store ? clone(store[k]) : d);
   window.GM_setValue = (k, v) => { store[k] = clone(v); persist(); };
   window.GM_deleteValue = (k) => { delete store[k]; persist(); };
+  window.GM_listValues = () => Object.keys(store);
   window.GM_info = { script: { version: '1.0.0-test' } };
   window.GM_registerMenuCommand = () => {};
   window.GM_addStyle = (css) => { const s = document.createElement('style'); s.textContent = css; (document.head || document.documentElement).appendChild(s); return s; };
@@ -55,7 +56,7 @@ CORS = {"access-control-allow-origin": "*", "access-control-allow-headers": "*",
 
 class Harness:
     def __init__(self, browser, settings=None, delay=500, width=1440, height=900, page_kind="shreddit",
-                 openai_status=200, ctx=None, by_id_status=200):
+                 openai_status=200, ctx=None, by_id_status=200, store=None):
         self.calls = {"openai": [], "tavily": [], "by_id": []}
         self.by_id_status = by_id_status
         self.openai_status = openai_status
@@ -64,8 +65,11 @@ class Harness:
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
         self.page.on("console", lambda m: m.type == "error" and self.errors.append("console: " + m.text))
         self.errors = []
-        init = {"rta.settings": settings} if settings is not None else {}
+        init = dict(store or {})
+        if settings is not None:
+            init["rta.settings"] = settings
         self.page.add_init_script(f"window.__GM_INIT = {json.dumps(init)}; window.__MOCK_DELAY = {delay};")
+        self.page.add_init_script("window.__RTA_TEST_HOOKS__ = true;")
         self.page.add_init_script(GM_SHIM)
         self.page.add_init_script(SCRIPT)
         self.page.route("https://www.reddit.com/**", self._reddit)
@@ -82,7 +86,14 @@ class Harness:
             if self.by_id_status != 200:
                 return route.fulfill(status=self.by_id_status, body="Too Many Requests")
             return route.fulfill(status=200, content_type="application/json", body=fx.by_id_json(ids))
-        body = fx.old_reddit_page() if u.netloc.startswith("old.") else fx.shreddit_page()
+        if u.netloc.startswith("old."):
+            body = fx.old_reddit_page()
+        elif u.path.startswith("/r/dupes"):
+            body = fx.shreddit_page(fx.DUPES)
+        elif u.path.startswith("/r/twins"):
+            body = fx.shreddit_page(fx.TWINS)
+        else:
+            body = fx.shreddit_page()
         route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
 
     def _openai(self, route):
@@ -104,8 +115,8 @@ class Harness:
         self.calls["tavily"].append({"headers": route.request.headers, "body": body})
         route.fulfill(status=200, headers=CORS, content_type="application/json", body=json.dumps(fx.tavily_reply(body)))
 
-    def goto(self, old=False):
-        self.page.goto("https://old.reddit.com/" if old else "https://www.reddit.com/")
+    def goto(self, old=False, path="/"):
+        self.page.goto("https://old.reddit.com/" if old else "https://www.reddit.com" + path)
         self.page.wait_for_selector("#reddit-truth-auditor", state="attached")
 
     # --- helpers -------------------------------------------------------------
@@ -131,6 +142,12 @@ class Harness:
 
     def scroll_to(self, pid):
         self.page.evaluate(f"(document.getElementById('t3_{pid}') || document.querySelector('[data-fullname=\"t3_{pid}\"]')).scrollIntoView({{block:'center'}})")
+
+    def calls_mentioning(self, text):
+        return [c for c in self.calls["openai"] if text in c["body"]["messages"][-1]["content"]]
+
+    def result(self, pid):
+        return self.page.evaluate(f"window.__RTA_TEST__.Log.get('t3_{pid}')")
 
     def shot(self, name):
         self.page.wait_for_timeout(700)  # let the slide animation settle
@@ -284,7 +301,7 @@ def threshold_is_configurable_via_settings(browser):
         h.page.locator(".launcher").click() if not h.panel_open() else None
         h.page.locator('.btn-icon[aria-label="Settings"]').click()
         h.page.wait_for_selector(".views.settings")
-        h.page.locator('input[type="range"]').evaluate(f"(el) => {{ el.value = {v}; el.dispatchEvent(new Event('input')); }}")
+        h.page.locator('input[aria-label="Risk threshold"]').evaluate(f"(el) => {{ el.value = {v}; el.dispatchEvent(new Event('input')); }}")
         h.page.locator(".btn.primary", has_text="Save").click()
         h.page.wait_for_timeout(1200)
 
@@ -300,7 +317,7 @@ def threshold_is_configurable_via_settings(browser):
     # satire toggle off -> onion (risk 90) flagged at threshold 60
     h.page.locator('.btn-icon[aria-label="Settings"]').click()
     h.page.wait_for_selector(".views.settings")
-    h.page.locator('input[type="range"]').evaluate("(el) => { el.value = 60; el.dispatchEvent(new Event('input')); }")
+    h.page.locator('input[aria-label="Risk threshold"]').evaluate("(el) => { el.value = 60; el.dispatchEvent(new Event('input')); }")
     h.page.locator(".check", has_text="satire").locator("input").uncheck()
     h.shot("06-settings")
     h.page.locator(".btn.primary", has_text="Save").click()
@@ -327,7 +344,7 @@ def cache_survives_reload_and_reflags(browser):
     h.wait_card_state("fake01", "done", timeout=5000)
     h.page.wait_for_selector(".panel.open", timeout=3000)
     check(fake01_calls() == 2, "cached result reused after reload, no new API calls")
-    check("from cache" in h.card("fake01").locator(".d-sec").last.text_content(), "marked as cached")
+    check("from research log" in h.card("fake01").locator(".d-sec").last.text_content(), "marked as coming from the log")
     # Re-check forces a new analysis
     h.card("fake01").locator(".btn", has_text="Re-check").click()
     h.wait_card_state("fake01", "done", timeout=8000)
@@ -488,6 +505,213 @@ def keyboard_shortcuts(browser):
     check(not h.panel_open(), "Esc closes")
     h.page.keyboard.press("Alt+Shift+R")
     h.page.wait_for_selector(".panel.open")
+    h.close()
+
+
+# ----------------------------------------------------------------------------- research log & duplicates
+@test
+def similarity_rules(browser):
+    h = Harness(browser, settings=dict(BASE, paused=True), delay=0)
+    h.goto()
+    r = h.page.evaluate("""() => {
+      const { tokenize: t, similarity: s, urlKey: u } = window.__RTA_TEST__;
+      const sim = (a, b) => Math.round(s(t(a), t(b)) * 100);
+      return {
+        punct: sim('WHO confirms 5G towers spread the virus!!!', 'WHO confirms 5G towers spread the virus'),
+        plural: sim('Canada sets its PR target at 380,000 people', "Canada's PR targets set at 380000 people"),
+        number: sim('Inflation just fell to 1%, the lowest level in 50 years', 'Inflation just fell to 3%, the lowest level in 50 years'),
+        negation: sim('The vaccine does cause autism in children', "The vaccine doesn't cause autism in children"),
+        short: sim('Is this real', 'Is this fake'),
+        unrelated: sim('Eiffel Tower completed in 1889', 'Octopuses have three hearts'),
+        url1: u('https://www.bbc.co.uk/news/article-1/?utm_source=x&fbclid=y'),
+        url2: u('https://m.bbc.co.uk/news/article-1'),
+        yt1: u('https://youtu.be/abc123?si=share'),
+        yt2: u('https://www.youtube.com/watch?v=abc123&feature=share'),
+        reddit: u('https://www.reddit.com/r/x/comments/abc/post/'),
+      };
+    }""")
+    check(r["punct"] == 100, f"punctuation ignored {r}")
+    check(r["plural"] == 100, f"plurals/possessives/thousand separators normalised {r}")
+    check(r["number"] == 0, f"different numbers never match {r}")
+    check(r["negation"] == 0, f"negation mismatch never matches {r}")
+    check(r["short"] == 0, f"short texts only match exactly {r}")
+    check(r["unrelated"] == 0, f"unrelated {r}")
+    check(r["url1"] == r["url2"] == "bbc.co.uk/news/article-1", f"url normalisation {r}")
+    check(r["yt1"] == r["yt2"], f"youtube normalisation {r}")
+    check(r["reddit"] == "", "reddit self links are not used for link matching")
+    h.close()
+
+
+@test
+def duplicates_reuse_earlier_verdicts(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=200), delay=150, ctx=ctx)
+    # 1. research the originals on the front page
+    h.goto()
+    for pid in ["fake01", "true03", "mixed05"]:
+        h.scroll_to(pid)
+        h.wait_card_state(pid, "done")
+    h.page.wait_for_timeout(1000)  # index save debounce
+    base_tavily = len(h.calls["tavily"])
+
+    # 2. browse a page full of reposts
+    h.goto(path="/r/dupes/")
+    for p in fx.DUPES:
+        h.scroll_to(p["id"])
+        h.page.wait_for_timeout(350)
+    for p in fx.DUPES:
+        h.page.wait_for_selector(f'.card.done[data-id="t3_{p["id"]}"]', state="attached", timeout=15000)
+    h.page.wait_for_timeout(500)
+
+    via = {p["id"]: (h.result(p["id"]).get("dupOf") or {}).get("via") for p in fx.DUPES}
+    check(via == {"fake01b": "text", "true03b": "link", "fake01x": "crosspost", "fake01p": "semantic", "fake01c": "claim", "mixed05n": None}, f"reuse routes {via}")
+
+    # token accounting: tier-1 duplicates cost nothing; claim duplicates cost only the extraction call
+    for pid, title in [("fake01b", fx.DUPES[0]["title"]), ("true03b", fx.DUPES[1]["title"]), ("fake01x", "Crazy if true")]:
+        check(not h.calls_mentioning(f"Title: {title}"), f"{pid}: no LLM call at all")
+    for pid in ["fake01p", "fake01c"]:
+        title = next(p["title"] for p in fx.DUPES if p["id"] == pid)
+        check(len(h.calls_mentioning(f"Title: {title}")) == 1, f"{pid}: only the extraction call")
+    check(len(h.calls_mentioning("Title: Inflation just fell to 3%")) == 2, "number-changed post gets a full check")
+    check(len(h.calls["tavily"]) == base_tavily + 1, f"only the new claim was web-searched ({len(h.calls['tavily']) - base_tavily})")
+    sem = h.calls_mentioning("Title: The World Health Organization now says")[0]["body"]["messages"][-1]["content"]
+    check("Previously fact-checked claims" in sem and "[C1]" in sem, "extraction prompt offered earlier claims")
+
+    # reused risky posts are still flagged + announced, and say where the verdict came from
+    h.page.wait_for_selector(".panel.open", timeout=3000)
+    for pid in ["fake01b", "fake01x", "fake01p", "fake01c"]:
+        check("flagged" in h.card_classes(pid), f"{pid} flagged from reused verdict")
+    note = h.card("fake01b").locator(".reuse").text_content()
+    check("Near-identical" in note and "BREAKING: WHO confirms 5G" in note and "No tokens were spent" in note, f"reuse note: {note}")
+    check("Reused" in h.card("fake01b").locator(".meta").text_content(), "reused tag")
+    h.card("fake01b").scroll_into_view_if_needed()
+    h.shot("11-reused-duplicates")
+
+    # 3. revisiting a logged post on a new page load costs nothing either
+    n = len(h.calls["openai"])
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(800)
+    check(len(h.calls["openai"]) == n, "revisit served from the log")
+
+    # 4. History tab
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.page.locator(".tab.hist").click()
+    h.page.wait_for_selector(".history .h-stats")
+    size = h.page.evaluate("window.__RTA_TEST__.Log.size()")
+    check(h.page.locator(".tab.hist .n").text_content() == str(size), "history count")
+    stats = h.page.locator(".h-stats").text_content()
+    check("posts logged" in stats and "repeats skipped" in stats, stats)
+    check(h.page.locator(".history .card:visible").count() == size, "all entries listed")
+    h.page.locator(".h-tools select").select_option("dup")
+    h.page.wait_for_timeout(200)
+    check(h.page.locator(".history .card:visible").count() == 5, f"reused filter ({h.page.locator('.history .card:visible').count()})")
+    h.page.locator(".h-tools select").select_option("all")
+    h.page.locator(".h-tools input").fill("inflation")
+    h.page.wait_for_timeout(500)
+    check(h.page.locator(".history .card:visible").count() == 2, f"search filter {h.page.locator('.history .card:visible .t').all_text_contents()}")
+    h.page.locator(".h-tools input").fill("")
+    h.page.wait_for_timeout(500)
+    h.shot("12-history-tab")
+
+    # 5. CSV export includes the provenance columns
+    with h.page.expect_download() as dl:
+        h.page.locator('.btn-icon[aria-label="Export CSV"]').click()
+    text = Path(dl.value.path()).read_text(encoding="utf-8-sig")
+    check(text.splitlines()[0].endswith("reused_from,reuse_via"), "csv header")
+    check(any("t3_fake01b" in l and '"t3_fake01"' in l and '"text"' in l for l in text.splitlines()), "dup row in csv")
+    check(not h.errors, f"page errors: {h.errors}")
+    h.close()
+
+
+@test
+def check_anyway_bypasses_dedupe(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=100), delay=100, ctx=ctx)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(800)
+    h.goto(path="/r/dupes/")
+    h.wait_card_state("fake01b", "done")
+    check(not h.calls_mentioning("Title: " + fx.DUPES[0]["title"]), "reused first")
+    if not h.panel_open():
+        h.page.locator(".launcher").click()
+    h.card("fake01b").locator(".btn", has_text="Check anyway").click()
+    h.page.wait_for_timeout(300)
+    h.wait_card_state("fake01b", "done")
+    h.page.wait_for_timeout(300)
+    check(len(h.calls_mentioning("Title: " + fx.DUPES[0]["title"])) == 2, "full check after Check anyway")
+    check(not h.result("fake01b").get("dupOf"), "fresh result stored")
+    h.close()
+
+
+@test
+def dedupe_can_be_disabled(browser):
+    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    h = Harness(browser, settings=dict(BASE, dwellMs=100, dedupe=False), delay=100, ctx=ctx)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    h.page.wait_for_timeout(800)
+    h.goto(path="/r/dupes/")
+    h.wait_card_state("fake01b", "done")
+    h.page.wait_for_timeout(300)
+    check(len(h.calls_mentioning("Title: " + fx.DUPES[0]["title"])) == 2, "full check when dedupe is off")
+    check("Previously fact-checked" not in h.calls["openai"][-1]["body"]["messages"][-1]["content"], "no candidates offered when off")
+    h.close()
+
+
+@test
+def simultaneous_twins_are_checked_once(browser):
+    h = Harness(browser, settings=dict(BASE, dwellMs=100, maxConcurrent=2), delay=400)
+    h.goto(path="/r/twins/")
+    h.wait_card_state("twina", "done")
+    h.wait_card_state("twinb", "done")
+    h.page.wait_for_timeout(300)
+    full = len(h.calls_mentioning("Audit this claim")) 
+    check(full == 1, f"only one audit for two identical posts on screen together ({full})")
+    check(len(h.calls["tavily"]) == 1, "one web search")
+    vias = [(h.result(p).get("dupOf") or {}).get("via") for p in ("twina", "twinb")]
+    check(sorted(map(str, vias)) == ["None", "text"], f"one original, one reuse {vias}")
+    h.close()
+
+
+@test
+def legacy_cache_migrated_and_old_entries_pruned(browser):
+    now = int(time.time() * 1000)
+    legacy_r = {"kind": "audit", "truth": 1, "sarcasm": 1, "risk": 90, "confidence": "high", "claim": fx.POSTS[0]["claim"],
+                "summary": "", "contentType": "news", "query": "", "factualCheck": "x", "contextCheck": "", "verdict": "False (from v1 cache).",
+                "researched": True, "researchError": None, "sources": [], "model": "gpt-4o-mini", "at": now - 3600e3,
+                "post": {"title": fx.POSTS[0]["title"], "subreddit": "worldnews", "permalink": "/r/worldnews/comments/fake01/post/", "domain": ""}}
+    old_r = dict(legacy_r, verdict="ancient", post=dict(legacy_r["post"], title="Old news"))
+    store = {
+        "rta.cache": {"t3_fake01": {"t": now - 3600e3, "r": legacy_r}},
+        "rta.log.t3_old999": {"t": now - 40 * 864e5, "r": old_r},
+        "rta.idx": {"t3_old999": [now - 40 * 864e5, "a", 90, "Old news", "worldnews", "old new", "", "", "", 1]},
+    }
+    h = Harness(browser, settings=BASE, delay=100, store=store)
+    h.goto()
+    h.wait_card_state("fake01", "done")
+    check(not h.calls_mentioning("5G towers"), "migrated v1 result reused, no API calls")
+    check("from v1 cache" in h.card("fake01").text_content(), "shows migrated verdict")
+    check(h.page.evaluate("GM_getValue('rta.cache', 'gone')") == "gone", "legacy key removed")
+    check(h.page.evaluate("GM_getValue('rta.log.t3_old999', 'gone')") == "gone", "entry older than logDays pruned")
+    check(h.page.evaluate("window.__RTA_TEST__.Log.get('t3_old999')") is None, "pruned from index")
+    h.close()
+
+
+@test
+def index_self_heals_from_records(browser):
+    now = int(time.time() * 1000)
+    r = {"kind": "audit", "truth": 1, "sarcasm": 1, "risk": 90, "confidence": "high", "claim": fx.POSTS[0]["claim"], "summary": "",
+         "contentType": "news", "query": "", "factualCheck": "", "contextCheck": "", "verdict": "False (record without index).",
+         "researched": False, "researchError": None, "sources": [], "model": "m", "at": now,
+         "post": {"title": fx.POSTS[0]["title"], "subreddit": "worldnews", "permalink": "/r/worldnews/comments/fake01/post/", "domain": ""}}
+    h = Harness(browser, settings=dict(BASE, dwellMs=100), delay=100, store={"rta.log.t3_fake01": {"t": now, "r": r}})
+    h.goto(path="/r/dupes/")   # a near-duplicate of the un-indexed record
+    h.wait_card_state("fake01b", "done")
+    check((h.result("fake01b").get("dupOf") or {}).get("id") == "t3_fake01", "duplicate matched against a reconciled record")
+    check("t3_fake01" in h.page.evaluate("GM_getValue('rta.idx', {})"), "index repaired")
     h.close()
 
 

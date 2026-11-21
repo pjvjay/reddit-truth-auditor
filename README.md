@@ -32,10 +32,29 @@ That's it – browse normally.
 | **Side panel** | A glassy panel slides in from the right (25 % of the screen, min 340 px) with a spinning card for every post being researched (*Claim → Research → Verdict*), then a risk gauge, verdict, sources and “Show post” for each result. |
 | **Configurable risk alert** | `risk = 100 − truth_score × 10`. The panel **auto-opens when a post at or above your threshold is on screen** (default 60 % ⇔ truth ≤ 4/10). Satire/jokes are not flagged by default. |
 | **Badges on posts** | Each checked post gets a small pill (*Fact-checking… / Looks accurate / Misleading? / Likely false*), and flagged posts get a red edge. Click a pill to open its card. |
-| **Cost controls** | Results cached for 24 h (shared across tabs), daily spend cap (default $0.50), parallel-check limit, pause button, subreddit allow/block lists. Today's spend is shown in the panel footer. |
-| **CSV export** | Download cached audits as CSV (same columns as `final_policy_audit.csv`, plus risk/sources). |
+| **Research log – never pays twice** | Every analysed post (scores, verdict, sources) is kept in a local log (30 days / 5,000 posts by default, shared across tabs). Posts already in the log are never re-analysed, and reposts are recognised – see below. A **History** tab lets you browse/search the log and shows how much was saved. |
+| **Cost controls** | Daily spend cap (default $0.50), parallel-check limit, pause button, subreddit allow/block lists. Today's spend and reuse count are shown in the panel footer. |
+| **CSV export** | Download the research log as CSV (same columns as `final_policy_audit.csv`, plus risk, sources and `reused_from` / `reuse_via`). |
 
 <img src="userscript/docs/panel-researching.png" alt="Posts being researched" width="720">
+
+### Research log & duplicate detection
+
+Before a post costs anything it is matched against the log, cheapest check first:
+
+| Tier | Match | Cost |
+|---|---|---|
+| 0 | **Same post** seen before (any tab, any earlier session) | free |
+| 1 | **Crosspost** of a logged post (`crosspost_parent`) | free |
+| 1 | **Same link** – URL normalised (tracking params, `www`/`m.`/AMP, `youtu.be`, trailing `/`) plus a loosely similar title | free |
+| 1 | **Near-identical text** – title + start of body, word-overlap ≥ the *Duplicate similarity* setting (default 80 %) | free |
+| 2 | **Same claim** – after the cheap claim-extraction call the claim is compared with logged claims (word-overlap), and the extraction model is shown up to 5 related earlier claims and asked whether this post makes *materially the same* claim | 1 small call; web research + audit skipped |
+
+Safeguards: two texts are never treated as duplicates if their **numbers differ** (“inflation fell to 1 %” ≠ “… 3 %”) or one is **negated** (“does” ≠ “doesn't”), and very short titles only match word-for-word. Identical posts that appear on screen together are checked once (the second waits for the first).
+
+Reused results are labelled **Reused** with a link to the original post and a **Check anyway** button that ignores the match and runs a full check. The History tab can **Forget** individual entries; *Settings → Advanced → Clear research log* wipes it.
+
+<img src="userscript/docs/panel-history.png" alt="History tab" width="720">
 
 ### Settings (⚙ in the panel, or Tampermonkey menu → *Settings…*)
 
@@ -50,7 +69,10 @@ That's it – browse normally.
 | Check after on-screen for | 1200 ms | Dwell time before a post is checked. |
 | Parallel checks | 2 | |
 | Daily spend cap | $0.50 | 0 = no cap. Estimated from token usage and the per-token prices under *Advanced*. |
-| Remember results | 24 h | |
+| Reuse verdicts for near-duplicates | on | Crossposts, same link, near-identical text, same claim. |
+| Duplicate similarity | 80 % | 50–100 %. Higher = stricter; 100 % = identical wording only. |
+| Keep research log | 30 days | Entries older than this are re-analysed if seen again. |
+| Max posts in log | 5,000 | Oldest entries are dropped first. |
 | Only / never these subreddits | – | Comma-separated, like `TARGET_SUBS` in the Python scripts. |
 | Reference facts | – | Ground-truth notes injected into the audit prompt (the "MASTER REFERENCE" idea from `test.py`). |
 
@@ -58,12 +80,13 @@ Shortcuts: **Alt+Shift+R** toggles the panel, **Esc** closes it.
 
 ### Cost
 
-Each post with a checkable claim uses two `gpt-4o-mini` calls (roughly $0.0003–0.0007 together) plus one Tavily search (the free tier currently includes 1,000 searches/month). Posts without a claim cost one small call. Cached posts cost nothing – so the default $0.50/day cap covers around 1,000 checked posts.
+Each post with a checkable claim uses two `gpt-4o-mini` calls (roughly $0.0003–0.0007 together) plus one Tavily search (the free tier currently includes 1,000 searches/month). Posts without a claim cost one small call. Posts already in the research log, crossposts, same-link and near-identical reposts cost nothing; same-claim reposts cost only the small extraction call – so the default $0.50/day cap covers around 1,000 checked posts.
 
 ### Privacy & limitations
 
-- Post text is sent to your LLM provider (and the search query to Tavily). Nothing else leaves your browser; there is no server.
+- Post text is sent to your LLM provider (and the search query to Tavily). Nothing else leaves your browser; there is no server. The research log lives in your userscript manager's local storage.
 - LLM fact-checking can be wrong – treat the panel as a prompt to look closer, not a final ruling. Check the sources under *Why this score*.
+- A reused verdict is as old as the original check. For fast-moving stories, lower *Keep research log* or use **Check anyway**.
 - Only post titles/bodies are checked (not comments, images or videos). Link posts are judged on their headline.
 - Reddit changes its markup from time to time; if badges stop appearing, update the script.
 
